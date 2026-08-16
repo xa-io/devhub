@@ -1,0 +1,25 @@
+# Exact root files
+/.gitattributes
+/.gitignore
+/.public-repo-allowlist
+/1. build.py
+/2. Prepare_release.py
+/CMakeLists.txt
+/CHANGELOG.md
+/CONTRIBUTING.md
+/LICENSE
+/NOTICE
+/PRIVACY.md
+/README.md
+/SECURITY.md
+/THIRD_PARTY_NOTICES.md
+/Update_Version.py
+/vcpkg-configuration.json
+/vcpkg.json
+
+# Intentionally public directory trees
+/include/
+/src/
+/third_party/licenses/
+/tools/
+/vcpkg-overlays/

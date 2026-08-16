@@ -1,0 +1,98 @@
+diff --git a/include/crow/http_connection.h b/include/crow/http_connection.h
+index 92e1f20..51f23f4 100644
+--- a/include/crow/http_connection.h
++++ b/include/crow/http_connection.h
+@@ -400,6 +400,16 @@ namespace crow
+                       }
+                   }
+ 
++                  if (error_while_reading && self->parser_.body_too_large())
++                  {
++                      self->cancel_deadline_timer();
++                      self->res = response(status::PAYLOAD_TOO_LARGE);
++                      self->close_connection_ = true;
++                      self->need_to_call_after_handlers_ = false;
++                      self->complete_request();
++                      return;
++                  }
++
+                   if (error_while_reading)
+                   {
+                       self->cancel_deadline_timer();
+diff --git a/include/crow/parser.h b/include/crow/parser.h
+index 0dcd6c6..8743c21 100644
+--- a/include/crow/parser.h
++++ b/include/crow/parser.h
+@@ -8,6 +8,10 @@
+ #include "crow/http_request.h"
+ #include "crow/http_parser_merged.h"
+ 
++#ifndef CROW_HTTP_BODY_LIMIT
++#define CROW_HTTP_BODY_LIMIT 0
++#endif
++
+ namespace crow
+ {
+     /// A wrapper for `nodejs/http-parser`.
+@@ -82,12 +86,33 @@ namespace crow
+ 
+             self->set_connection_parameters();
+ 
++#if CROW_HTTP_BODY_LIMIT > 0
++            if ((self->flags & F_CONTENTLENGTH) != 0 &&
++                (self->flags & F_CHUNKED) == 0 &&
++                self->content_length > static_cast<uint64_t>(CROW_HTTP_BODY_LIMIT))
++            {
++                self->body_too_large_ = true;
++                // on_headers_complete return 1 means "skip body" in
++                // http-parser. Use a real callback error so Crow emits 413
++                // instead of routing an empty request.
++                return -1;
++            }
++#endif
++
+             self->process_header();
+             return 0;
+         }
+         static int on_body(http_parser* self_, const char* at, size_t length)
+         {
+             HTTPParser* self = static_cast<HTTPParser*>(self_);
++#if CROW_HTTP_BODY_LIMIT > 0
++            const size_t limit = static_cast<size_t>(CROW_HTTP_BODY_LIMIT);
++            if (length > limit || self->req.body.size() > limit - length)
++            {
++                self->body_too_large_ = true;
++                return 1;
++            }
++#endif
+             self->req.body.insert(self->req.body.end(), at, at + length);
+             return 0;
+         }
+@@ -135,6 +161,11 @@ namespace crow
+             return feed(nullptr, 0);
+         }
+ 
++        bool body_too_large() const
++        {
++            return body_too_large_;
++        }
++
+         void clear()
+         {
+             req = crow::request();
+@@ -143,6 +174,7 @@ namespace crow
+             qs_point = 0;
+             message_complete = false;
+             state = CROW_NEW_MESSAGE();
++            body_too_large_ = false;
+         }
+ 
+         inline void process_url()
+@@ -184,6 +216,7 @@ namespace crow
+         std::string header_field;
+         std::string header_value;
+ 
++        bool body_too_large_ = false;
+         Handler* handler_; ///< This is currently an HTTP connection object (\ref crow.Connection).
+     };
+ } // namespace crow

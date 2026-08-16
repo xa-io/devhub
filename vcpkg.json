@@ -1,0 +1,26 @@
+{
+    "name": "xa-devhub",
+    "version": "1.0.5",
+    "license": "AGPL-3.0-or-later",
+    "builtin-baseline": "f87344cac03158cbf1467264565f1fd36b382a24",
+    "description": "XA DevHub - native developer project tracker: issues, todos, credits, calendar, build/release pipeline, version tracking, embedded Discord suggestion monitoring",
+    "dependencies": [
+        "crow",
+        "nlohmann-json",
+        "sqlitecpp",
+        {
+            "name": "dpp",
+            "version>=": "10.1.5"
+        },
+        {
+            "name": "imgui",
+            "features": ["dx11-binding", "win32-binding"]
+        }
+    ],
+    "overrides": [
+        {
+            "name": "dpp",
+            "version": "10.1.5"
+        }
+    ]
+}

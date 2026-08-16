@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.zip binary
+
+# Preserve verbatim third-party notices and upstream patch payload whitespace.
+third_party/licenses/** whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+vcpkg-overlays/**/*.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

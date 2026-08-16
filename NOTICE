@@ -1,0 +1,13 @@
+XA DevHub
+Copyright (C) 2026 XA DevHub contributors
+
+This program is free software licensed under the GNU Affero General Public
+License, version 3 or (at your option) any later version. See LICENSE.
+
+The XA DevHub name and logo identify the original project. The software
+license does not grant permission to imply endorsement by the original
+project. Forks may modify the program and branding subject to the license.
+
+The program uses separately licensed third-party components. Their licenses
+and required notices are listed in THIRD_PARTY_NOTICES.md and preserved under
+third_party/licenses/.
