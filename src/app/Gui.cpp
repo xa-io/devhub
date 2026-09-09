@@ -1495,7 +1495,7 @@ static void openEditItem(App& a, const Item& it) {
     copyBuf(a.eiReview, sizeof(a.eiReview), it.reviewDate);
     copyBuf(a.eiBlocked, sizeof(a.eiBlocked), it.blockedReason);
     a.eiAddSource[0] = 0;
-    a.eiMergeTarget = -1;
+    a.eiMergeSourceIds.clear();
     a.eiType = 0;
     for (int i = 0; i < 4; ++i)
         if (it.type == kTypeNames[i]) a.eiType = i;

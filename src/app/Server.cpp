@@ -15,6 +15,7 @@
 
 #include <bcrypt.h>
 #include <sddl.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <ctime>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -39,6 +41,7 @@ namespace {
 
 constexpr size_t kMaxJsonBodyBytes = 1 * 1024 * 1024;
 constexpr size_t kMaxHttpBodyBytes = 2 * 1024 * 1024;
+constexpr char kApiRendezvousSchema[] = "xa-devhub.api-rendezvous/v1";
 static_assert(kMaxHttpBodyBytes == CROW_HTTP_BODY_LIMIT,
               "Crow transport cap and application cap must match");
 
@@ -146,33 +149,104 @@ std::wstring currentUserSidString() {
     return result;
 }
 
-void writeCurrentUserOnlyToken(const std::string& dataDir,
-                               const std::string& token) {
-    if (dataDir.empty())
-        throw std::runtime_error("API token data directory is empty");
-    const std::wstring path = widen(dataDir + "\\api-token");
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes != INVALID_FILE_ATTRIBUTES && !DeleteFileW(path.c_str()))
-        throw std::runtime_error("could not rotate the API token file");
+std::string canonicalLoopbackOrigin(uint16_t port) {
+    if (port == 0) throw std::runtime_error("API port must be positive");
+    return "http://127.0.0.1:" + std::to_string(port);
+}
+
+std::filesystem::path localApiRendezvousRoot() {
+    PWSTR raw = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(
+        FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &raw);
+    if (FAILED(result) || raw == nullptr)
+        throw std::runtime_error("could not resolve LocalAppData for API discovery");
+    const std::filesystem::path root(raw);
+    CoTaskMemFree(raw);
+    return root / L"XA DevHub" / L"api";
+}
+
+json apiRendezvousRecord(const std::string& token, uint16_t port) {
+    return json{
+        {"schema", kApiRendezvousSchema},
+        {"origin", canonicalLoopbackOrigin(port)},
+        {"pid", static_cast<unsigned long long>(GetCurrentProcessId())},
+        {"token", token},
+    };
+}
+
+json readApiRendezvous(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("could not reopen the API rendezvous");
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        size.QuadPart > 4096) {
+        CloseHandle(file);
+        throw std::runtime_error("API rendezvous size is invalid");
+    }
+    std::string contents(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD read = 0;
+    const bool ok = ReadFile(file, contents.data(),
+                             static_cast<DWORD>(contents.size()), &read,
+                             nullptr) &&
+                    read == contents.size();
+    CloseHandle(file);
+    if (!ok) throw std::runtime_error("could not read back the API rendezvous");
+    try {
+        return json::parse(contents);
+    } catch (const std::exception&) {
+        throw std::runtime_error("API rendezvous JSON is invalid");
+    }
+}
+
+void verifyApiRendezvous(const std::wstring& path, const std::string& token,
+                         uint16_t port) {
+    const json record = readApiRendezvous(path);
+    if (!record.is_object() ||
+        record.value("schema", "") != kApiRendezvousSchema ||
+        record.value("origin", "") != canonicalLoopbackOrigin(port) ||
+        record.value("pid", 0ULL) !=
+            static_cast<unsigned long long>(GetCurrentProcessId()) ||
+        !constantTimeTokenEqual(record.value("token", ""), token))
+        throw std::runtime_error("API rendezvous verification failed");
+}
+
+void writeCurrentUserOnlyRendezvous(const std::string& pathUtf8,
+                                    const std::string& token, uint16_t port) {
+    const std::filesystem::path destination = widen(pathUtf8);
+    std::error_code directoryError;
+    std::filesystem::create_directories(destination.parent_path(), directoryError);
+    if (directoryError)
+        throw std::runtime_error("could not create the local API rendezvous directory");
+
+    const std::wstring path = destination.wstring();
+    const std::wstring temporary = path + L".tmp-" +
+        std::to_wstring(GetCurrentProcessId());
+    const DWORD temporaryAttributes = GetFileAttributesW(temporary.c_str());
+    if (temporaryAttributes != INVALID_FILE_ATTRIBUTES &&
+        !DeleteFileW(temporary.c_str()))
+        throw std::runtime_error("could not clear a stale API rendezvous temporary file");
 
     const std::wstring descriptorText =
         L"D:P(A;;FA;;;" + currentUserSidString() + L")";
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             descriptorText.c_str(), SDDL_REVISION_1, &descriptor, nullptr))
-        throw std::runtime_error("could not secure the API token file");
+        throw std::runtime_error("could not secure the API rendezvous");
 
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
     security.lpSecurityDescriptor = descriptor;
     security.bInheritHandle = FALSE;
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, &security,
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, &security,
                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     LocalFree(descriptor);
     if (file == INVALID_HANDLE_VALUE)
-        throw std::runtime_error("could not create the API token file");
+        throw std::runtime_error("could not create the API rendezvous");
 
-    const std::string contents = token + "\n";
+    const std::string contents = apiRendezvousRecord(token, port).dump() + "\n";
     DWORD written = 0;
     const bool ok = WriteFile(file, contents.data(),
                               static_cast<DWORD>(contents.size()), &written,
@@ -180,24 +254,88 @@ void writeCurrentUserOnlyToken(const std::string& dataDir,
                     written == contents.size() && FlushFileBuffers(file);
     CloseHandle(file);
     if (!ok) {
+        DeleteFileW(temporary.c_str());
+        throw std::runtime_error("could not write the API rendezvous");
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        throw std::runtime_error("could not publish the API rendezvous atomically");
+    }
+    try {
+        verifyApiRendezvous(path, token, port);
+    } catch (...) {
         DeleteFileW(path.c_str());
-        throw std::runtime_error("could not write the API token file");
+        throw;
+    }
+}
+
+HANDLE acquireApiPortLease(uint16_t port) {
+    if (port == 0) throw std::runtime_error("API port must be positive");
+    const std::wstring name = L"Global\\XADevHub.ApiPort.v1." +
+        std::to_wstring(port);
+    SetLastError(ERROR_SUCCESS);
+    HANDLE lease = CreateMutexW(nullptr, FALSE, name.c_str());
+    const DWORD error = GetLastError();
+    if (lease == nullptr) {
+        if (error == ERROR_ACCESS_DENIED) return nullptr;
+        throw std::runtime_error("could not acquire the API port lease");
+    }
+    if (error == ERROR_ALREADY_EXISTS) {
+        CloseHandle(lease);
+        return nullptr;
+    }
+    return lease;
+}
+
+void releaseApiPortLease(HANDLE& lease) {
+    if (lease == nullptr || lease == INVALID_HANDLE_VALUE) return;
+    CloseHandle(lease);
+    lease = nullptr;
+}
+
+void removeApiRendezvousIfOwned(const std::string& pathUtf8,
+                                const std::string& token, uint16_t port) {
+    if (pathUtf8.empty()) return;
+    try {
+        const std::wstring path = widen(pathUtf8);
+        const json record = readApiRendezvous(path);
+        if (record.value("origin", "") == canonicalLoopbackOrigin(port) &&
+            record.value("pid", 0ULL) ==
+                static_cast<unsigned long long>(GetCurrentProcessId()) &&
+            constantTimeTokenEqual(record.value("token", ""), token))
+            DeleteFileW(path.c_str());
+    } catch (...) {
+        // A missing, stale, or replacement record belongs to no cleanup path
+        // here. Never delete a rendezvous unless this instance proves ownership.
     }
 }
 
 } // namespace
 
+std::string apiRendezvousPath(uint16_t port,
+                              const std::string& rendezvousRootOverride) {
+    const std::filesystem::path root = rendezvousRootOverride.empty()
+        ? localApiRendezvousRoot()
+        : std::filesystem::path(widen(rendezvousRootOverride));
+    const std::filesystem::path path =
+        root / ("api-token-v1-" + std::to_string(port) + ".json");
+    const std::u8string pathUtf8 = path.u8string();
+    return std::string(reinterpret_cast<const char*>(pathUtf8.data()),
+                       pathUtf8.size());
+}
+
 struct Server::Impl {
     crow::App<ApiGuard> app;
     std::string token;
+    HANDLE portLease = nullptr;
 };
 
 Server::Server(Db* db, BuildRunner* builds, uint16_t port,
-               const std::string& dataDir)
+               const std::string& rendezvousRootOverride)
     : impl_(std::make_unique<Impl>()), db_(db), builds_(builds), port_(port),
-      dataDir_(dataDir) {
+      rendezvousRootOverride_(rendezvousRootOverride) {
     impl_->token = makeApiToken();
-    writeCurrentUserOnlyToken(dataDir_, impl_->token);
     auto& guard = impl_->app.get_middleware<ApiGuard>();
     guard.token = impl_->token;
     guard.port = port_;
@@ -561,7 +699,11 @@ SELECT i.id,i.project_id,p.name AS project_name,i.type,i.title,i.body,i.status,
  (SELECT COUNT(*) FROM ticket_attachments a WHERE a.item_id=i.id) AS attachment_count,
  (SELECT COUNT(*) FROM discord_notify_failure_dismissals d
    JOIN discord_notify_cards dn ON dn.id=d.card_row_id
-   WHERE dn.item_id=i.id) AS notification_acknowledgement_count
+   WHERE dn.item_id=i.id) AS notification_acknowledgement_count,
+ COALESCE((SELECT target_item_id FROM item_merges m
+   WHERE m.source_item_id=i.id),0) AS merged_into_id,
+ (SELECT COUNT(*) FROM item_merges m
+   WHERE m.target_item_id=i.id) AS merged_source_count
 FROM items i JOIN projects p ON p.id=i.project_id
 LEFT JOIN item_sources x ON x.item_id=i.id LEFT JOIN sources s ON s.id=x.source_id
 WHERE i.id=? GROUP BY i.id)sql");
@@ -788,6 +930,403 @@ WHERE id=?)sql");
         if (detail.find("UNIQUE") != std::string::npos)
             return errRes(409, "another project already uses that name");
         return internalErrRes(500, "project_save_failed", detail);
+    }
+}
+
+struct WorkSaveInput {
+    long long projectId = 0;
+    std::string type;
+    std::string title;
+    std::string body;
+    int priority = 2;
+    std::string dueDate;
+    std::string reviewDate;
+    std::string tags;
+};
+
+static bool workStringField(const json& body, const char* field,
+                            size_t maximum, std::string& value,
+                            std::string& error) {
+    if (!body.contains(field)) {
+        error = std::string("work payload is missing '") + field + "'";
+        return false;
+    }
+    const json& candidate = body[field];
+    if (!candidate.is_string()) {
+        error = std::string("work field '") + field + "' must be a string";
+        return false;
+    }
+    value = candidate.get<std::string>();
+    if (value.size() > maximum) {
+        error = std::string("work field '") + field + "' is too large";
+        return false;
+    }
+    if (value.find('\0') != std::string::npos) {
+        error = std::string("work field '") + field +
+                "' contains a null character";
+        return false;
+    }
+    return true;
+}
+
+static bool exactObjectFields(const json& value,
+                              const std::set<std::string>& allowed,
+                              const std::string& label,
+                              std::string& error) {
+    if (!value.is_object()) {
+        error = label + " must be an object";
+        return false;
+    }
+    for (auto it = value.begin(); it != value.end(); ++it) {
+        if (allowed.find(it.key()) == allowed.end()) {
+            error = "unexpected " + label + " field '" + it.key() + "'";
+            return false;
+        }
+    }
+    if (value.size() != allowed.size()) {
+        error = label + " requires every documented field";
+        return false;
+    }
+    return true;
+}
+
+struct WorkTitleInput {
+    std::string title;
+    std::string expectedUpdatedAt;
+};
+
+static bool parseWorkTitleInput(const json& body, WorkTitleInput& input,
+                                std::string& error) {
+    static const std::set<std::string> allowed = {
+        "title", "expected_updated_at"
+    };
+    if (!exactObjectFields(body, allowed, "work title payload", error) ||
+        !workStringField(body, "title", 511, input.title, error) ||
+        !workStringField(body, "expected_updated_at", 64,
+                         input.expectedUpdatedAt, error))
+        return false;
+    input.title = trim(input.title);
+    input.expectedUpdatedAt = trim(input.expectedUpdatedAt);
+    if (input.title.empty()) {
+        error = "work title cannot be blank";
+        return false;
+    }
+    if (input.expectedUpdatedAt.empty()) {
+        error = "expected_updated_at cannot be blank";
+        return false;
+    }
+    return true;
+}
+
+struct WorkMergeSourceInput {
+    long long id = 0;
+    std::string expectedUpdatedAt;
+};
+
+struct WorkMergeInput {
+    std::string expectedUpdatedAt;
+    std::vector<WorkMergeSourceInput> sources;
+};
+
+static bool parseWorkMergeInput(const json& body, long long targetId,
+                                WorkMergeInput& input,
+                                std::string& error) {
+    static const std::set<std::string> allowed = {
+        "expected_updated_at", "sources"
+    };
+    static const std::set<std::string> sourceAllowed = {
+        "id", "expected_updated_at"
+    };
+    if (!exactObjectFields(body, allowed, "work merge payload", error) ||
+        !workStringField(body, "expected_updated_at", 64,
+                         input.expectedUpdatedAt, error))
+        return false;
+    input.expectedUpdatedAt = trim(input.expectedUpdatedAt);
+    if (input.expectedUpdatedAt.empty()) {
+        error = "expected_updated_at cannot be blank";
+        return false;
+    }
+    if (!body["sources"].is_array() || body["sources"].empty() ||
+        body["sources"].size() > 200) {
+        error = "sources must contain 1 through 200 entries";
+        return false;
+    }
+
+    std::set<long long> distinct{targetId};
+    input.sources.clear();
+    input.sources.reserve(body["sources"].size());
+    for (const json& source : body["sources"]) {
+        if (!exactObjectFields(source, sourceAllowed,
+                               "work merge source", error))
+            return false;
+        if (!source["id"].is_number_integer()) {
+            error = "work merge source id must be an integer";
+            return false;
+        }
+        WorkMergeSourceInput parsed;
+        parsed.id = source["id"].get<long long>();
+        if (parsed.id <= 0 || !distinct.insert(parsed.id).second) {
+            error = "work merge source and target ids must be distinct and positive";
+            return false;
+        }
+        if (!workStringField(source, "expected_updated_at", 64,
+                             parsed.expectedUpdatedAt, error))
+            return false;
+        parsed.expectedUpdatedAt = trim(parsed.expectedUpdatedAt);
+        if (parsed.expectedUpdatedAt.empty()) {
+            error = "source expected_updated_at cannot be blank";
+            return false;
+        }
+        input.sources.push_back(std::move(parsed));
+    }
+    return true;
+}
+
+static bool parseWorkSaveInput(const json& body, WorkSaveInput& input,
+                               std::string& error) {
+    static const std::set<std::string> allowed = {
+        "project_id", "type", "title", "body", "priority", "due_date",
+        "review_date", "tags"
+    };
+    for (auto it = body.begin(); it != body.end(); ++it) {
+        if (allowed.find(it.key()) == allowed.end()) {
+            error = "unexpected work field '" + it.key() + "'";
+            return false;
+        }
+    }
+    if (body.size() != allowed.size()) {
+        error = "work create requires every editable creation field";
+        return false;
+    }
+    if (!body["project_id"].is_number_integer()) {
+        error = "work field 'project_id' must be an integer";
+        return false;
+    }
+    input.projectId = body["project_id"].get<long long>();
+    if (input.projectId <= 0) {
+        error = "work field 'project_id' must be positive";
+        return false;
+    }
+    if (!body["priority"].is_number_integer()) {
+        error = "work field 'priority' must be an integer";
+        return false;
+    }
+    input.priority = body["priority"].get<int>();
+    if (input.priority < 1 || input.priority > 4) {
+        error = "work priority must be P1 through P4";
+        return false;
+    }
+
+    constexpr size_t kMaxWorkTitleBytes = 511;
+    constexpr size_t kMaxWorkBodyBytes = 16 * 1024 - 1;
+    constexpr size_t kMaxWorkDateBytes = 10;
+    constexpr size_t kMaxWorkTagsBytes = 2048;
+    if (!workStringField(body, "type", 32, input.type, error) ||
+        !workStringField(body, "title", kMaxWorkTitleBytes,
+                         input.title, error) ||
+        !workStringField(body, "body", kMaxWorkBodyBytes,
+                         input.body, error) ||
+        !workStringField(body, "due_date", kMaxWorkDateBytes,
+                         input.dueDate, error) ||
+        !workStringField(body, "review_date", kMaxWorkDateBytes,
+                         input.reviewDate, error) ||
+        !workStringField(body, "tags", kMaxWorkTagsBytes,
+                         input.tags, error))
+        return false;
+
+    input.type = toLower(trim(input.type));
+    input.title = trim(input.title);
+    input.body = trim(input.body);
+    input.dueDate = trim(input.dueDate);
+    input.reviewDate = trim(input.reviewDate);
+    input.tags = trim(input.tags);
+    if (input.type != "fix" && input.type != "implementation" &&
+        input.type != "reference" && input.type != "note") {
+        error = "work type must be fix, implementation, reference, or note";
+        return false;
+    }
+    if (input.title.empty()) {
+        error = "work title cannot be blank";
+        return false;
+    }
+    const auto validDate = [](const std::string& value) {
+        if (value.empty()) return true;
+        if (value.size() != 10 || value[4] != '-' || value[7] != '-')
+            return false;
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (i == 4 || i == 7) continue;
+            if (value[i] < '0' || value[i] > '9') return false;
+        }
+        const int year = std::stoi(value.substr(0, 4));
+        const int month = std::stoi(value.substr(5, 2));
+        const int day = std::stoi(value.substr(8, 2));
+        if (year < 1 || month < 1 || month > 12 || day < 1) return false;
+        static constexpr int daysByMonth[] = {
+            31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+        };
+        int maximum = daysByMonth[month - 1];
+        if (month == 2 &&
+            (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
+            maximum = 29;
+        return day <= maximum;
+    };
+    if (!validDate(input.dueDate) || !validDate(input.reviewDate)) {
+        error = "work dates must be blank or valid YYYY-MM-DD values";
+        return false;
+    }
+    return true;
+}
+
+static crow::response saveWorkItem(Db* db, const json& body) {
+    WorkSaveInput input;
+    std::string error;
+    if (!parseWorkSaveInput(body, input, error))
+        return errRes(400, error);
+
+    try {
+        auto lk = db->guard();
+        SQLite::Transaction tx(db->raw(lk.token()));
+        SQLite::Statement project(db->raw(lk.token()),
+            "SELECT archived FROM projects WHERE id=?");
+        project.bind(1, input.projectId);
+        if (!project.executeStep()) return errRes(404, "project not found");
+        if (project.getColumn(0).getInt() != 0)
+            return errRes(409, "archived projects cannot receive new work");
+
+        SQLite::Statement duplicate(db->raw(lk.token()), R"sql(
+SELECT id,type,body,priority,due_date,review_date,tags
+FROM items
+WHERE project_id=? AND title=? COLLATE NOCASE
+  AND status IN ('open','in_progress','blocked')
+ORDER BY id LIMIT 1)sql");
+        duplicate.bind(1, input.projectId);
+        duplicate.bind(2, input.title);
+        if (duplicate.executeStep()) {
+            const long long existingId = duplicate.getColumn(0).getInt64();
+            const bool exactReplay =
+                duplicate.getColumn(1).getString() == input.type &&
+                duplicate.getColumn(2).getString() == input.body &&
+                duplicate.getColumn(3).getInt() == input.priority &&
+                duplicate.getColumn(4).getString() == input.dueDate &&
+                duplicate.getColumn(5).getString() == input.reviewDate &&
+                duplicate.getColumn(6).getString() == input.tags;
+            if (exactReplay) {
+                tx.commit();
+                return jsonRes(json{{"ok", true}, {"id", existingId},
+                                    {"created", false},
+                                    {"duplicate", true}});
+            }
+            return jsonRes(json{{"ok", false}, {"code", "conflict"},
+                                {"error", "an active work item already uses that title"},
+                                {"existing_id", existingId}}, 409);
+        }
+
+        const long long itemId = insertItemLocked(
+            lk.token(), db, input.projectId, input.type, input.title,
+            input.body, input.priority, 0, "api", input.dueDate, input.tags);
+        SQLite::Statement review(db->raw(lk.token()),
+            "UPDATE items SET review_date=? WHERE id=?");
+        review.bind(1, input.reviewDate);
+        review.bind(2, itemId);
+        review.exec();
+        db->logActivity(lk.token(), "item_added", input.projectId,
+                        input.title);
+        tx.commit();
+        return jsonRes(json{{"ok", true}, {"id", itemId},
+                            {"created", true}, {"duplicate", false}}, 201);
+    } catch (const std::exception& e) {
+        return internalErrRes(500, "work_save_failed", e.what());
+    }
+}
+
+static crow::response updateWorkTitle(Db* db, DiscordBot* bot,
+                                      long long itemId,
+                                      const json& body) {
+    WorkTitleInput input;
+    std::string error;
+    if (!parseWorkTitleInput(body, input, error))
+        return errRes(400, error);
+
+    try {
+        auto lk = db->guard();
+        json current = getWorkItemLocked(lk.token(), db, itemId);
+        if (!current.value("ok", false)) return opRes(current);
+        if (current.value("status", "") == "merged")
+            return errRes(409, "merged audit records cannot change title");
+        const std::string currentUpdatedAt =
+            current.value("updated_at", std::string());
+        if (currentUpdatedAt != input.expectedUpdatedAt)
+            return errRes(409, "work item changed after it was reviewed");
+        if (current.value("title", std::string()) == input.title)
+            return jsonRes(current);
+
+        SQLite::Transaction tx(db->raw(lk.token()));
+        SQLite::Statement update(db->raw(lk.token()),
+            "UPDATE items SET title=?,updated_at=? "
+            "WHERE id=? AND updated_at=? AND status<>'merged'");
+        update.bind(1, input.title);
+        update.bind(2, nextIsoUtcAfter(currentUpdatedAt));
+        update.bind(3, itemId);
+        update.bind(4, currentUpdatedAt);
+        if (update.exec() != 1)
+            return errRes(409, "work item changed before its title could be saved");
+        updateNotifyCardForItemLocked(
+            lk.token(), db, bot, itemId, current.value("status", ""));
+        tx.commit();
+        return jsonRes(getWorkItemLocked(lk.token(), db, itemId));
+    } catch (const std::exception& e) {
+        return internalErrRes(500, "work_title_update_failed", e.what());
+    }
+}
+
+static crow::response mergeWorkItems(Db* db, DiscordBot* bot,
+                                     long long targetId,
+                                     const json& body) {
+    WorkMergeInput input;
+    std::string error;
+    if (!parseWorkMergeInput(body, targetId, input, error))
+        return errRes(400, error);
+
+    try {
+        auto lk = db->guard();
+        json target = getWorkItemLocked(lk.token(), db, targetId);
+        if (!target.value("ok", false)) return opRes(target);
+        if (target.value("status", "") == "merged")
+            return errRes(409, "a merged audit record cannot be a merge target");
+        if (target.value("updated_at", std::string()) !=
+            input.expectedUpdatedAt)
+            return errRes(409, "merge target changed after it was reviewed");
+
+        std::vector<long long> sourceIds;
+        sourceIds.reserve(input.sources.size());
+        for (const WorkMergeSourceInput& sourceInput : input.sources) {
+            json source = getWorkItemLocked(lk.token(), db, sourceInput.id);
+            if (!source.value("ok", false)) return opRes(source);
+            if (source.value("status", "") == "merged")
+                return errRes(409, "a merged audit record cannot be merged again");
+            if (source.value("project_id", 0LL) !=
+                target.value("project_id", 0LL))
+                return errRes(409, "tickets can only be merged within one project");
+            if (source.value("updated_at", std::string()) !=
+                sourceInput.expectedUpdatedAt)
+                return errRes(409, "merge source changed after it was reviewed");
+            sourceIds.push_back(sourceInput.id);
+        }
+
+        if (!mergeItemsLocked(lk.token(), db, sourceIds, targetId,
+                              error, bot))
+            return errRes(409, error.empty() ? "ticket merge was rejected" : error);
+
+        json sources = json::array();
+        for (long long sourceId : sourceIds)
+            sources.push_back(getWorkItemLocked(lk.token(), db, sourceId));
+        return jsonRes(json{
+            {"ok", true},
+            {"target", getWorkItemLocked(lk.token(), db, targetId)},
+            {"sources", std::move(sources)},
+        });
+    } catch (const std::exception& e) {
+        return internalErrRes(500, "work_merge_failed", e.what());
     }
 }
 
@@ -1159,6 +1698,16 @@ GROUP BY i.id ORDER BY i.priority DESC,i.updated_at)sql");
         return jsonRes(Db::rowsToJson(q));
     });
 
+    // Creates one canonical open ticket through the same item operation used
+    // by the native UI. Exact active replays are idempotent; a same-title
+    // active item with different content is a conflict that requires review.
+    CROW_ROUTE(app, "/api/work").methods("POST"_method)(
+        [db](const crow::request& req) {
+        json body; crow::response rejected;
+        if (!jsonRequest(req, body, rejected)) return rejected;
+        return saveWorkItem(db, body);
+    });
+
     // Additive reconciliation from one explicitly selected historical DevHub
     // data root. The operation preflights the complete batch, preserves exact
     // ticket/provenance/attachment history, and never updates or deletes a
@@ -1183,6 +1732,26 @@ GROUP BY i.id ORDER BY i.priority DESC,i.updated_at)sql");
         if (id <= 0) return errRes(400, "work item id must be positive");
         auto lk = db->guard();
         return opRes(getWorkItemLocked(lk.token(), db, id));
+    });
+
+    // Strict title-only mutation with exact optimistic concurrency. No body,
+    // status, priority, attribution, or evidence field is accepted here.
+    CROW_ROUTE(app, "/api/work/<int>/title").methods("POST"_method)(
+        [this, db](const crow::request& req, int id) {
+        if (id <= 0) return errRes(400, "work item id must be positive");
+        json body; crow::response rejected;
+        if (!jsonRequest(req, body, rejected)) return rejected;
+        return updateWorkTitle(db, bot, id, body);
+    });
+
+    // One same-project batch merge. The target and every source are bound to
+    // the exact updated_at values the caller reviewed before the transaction.
+    CROW_ROUTE(app, "/api/work/<int>/merge").methods("POST"_method)(
+        [this, db](const crow::request& req, int id) {
+        if (id <= 0) return errRes(400, "work item id must be positive");
+        json body; crow::response rejected;
+        if (!jsonRequest(req, body, rejected)) return rejected;
+        return mergeWorkItems(db, bot, id, body);
     });
 
     // Body: {status: open|in_progress|blocked|completed|wont_do}. The shared
@@ -1534,19 +2103,41 @@ GROUP BY i.id ORDER BY i.priority DESC,i.updated_at)sql");
         return jsonRes(json{{"ok", true}});
     });
 
-    th_ = std::thread([this]() {
-        try {
-            impl_->app.bindaddr("127.0.0.1")
-                .port(port_)
-                .timeout(15)
-                .concurrency(4)
-                .run();
-        } catch (const std::exception& e) {
-            appLog(std::string("[server] worker failed: ") + e.what());
-        } catch (...) {
-            appLog("[server] worker failed with an unknown exception");
-        }
-    });
+    try {
+        impl_->portLease = acquireApiPortLease(port_);
+    } catch (const std::exception& e) {
+        appLog(std::string("[server] API port lease unavailable: ") + e.what());
+        return 0;
+    }
+    if (impl_->portLease == nullptr) {
+        appLog("[server] loopback port " + std::to_string(port_) +
+               " is already owned by another XA DevHub instance");
+        return 0;
+    }
+
+    try {
+        th_ = std::thread([this]() {
+            try {
+                impl_->app.bindaddr("127.0.0.1")
+                    .port(port_)
+                    .timeout(15)
+                    .concurrency(4)
+                    .run();
+            } catch (const std::exception& e) {
+                appLog(std::string("[server] worker failed: ") + e.what());
+            } catch (...) {
+                appLog("[server] worker failed with an unknown exception");
+            }
+        });
+    } catch (const std::exception& e) {
+        appLog(std::string("[server] API worker could not start: ") + e.what());
+        releaseApiPortLease(impl_->portLease);
+        return 0;
+    } catch (...) {
+        appLog("[server] API worker could not start with an unknown exception");
+        releaseApiPortLease(impl_->portLease);
+        return 0;
+    }
     const std::cv_status started = impl_->app.wait_for_server_start(
         std::chrono::seconds(5));
     if (started == std::cv_status::timeout || !impl_->app.is_bound()) {
@@ -1554,6 +2145,20 @@ GROUP BY i.id ORDER BY i.priority DESC,i.updated_at)sql");
                " could not be bound; the local API is disabled");
         impl_->app.stop();
         if (th_.joinable()) th_.join();
+        releaseApiPortLease(impl_->portLease);
+        return 0;
+    }
+    try {
+        // The machine-wide lease remains held after Crow binds and through
+        // cleanup, so SO_REUSEADDR cannot let another DevHub rotate the token.
+        rendezvousPath_ = apiRendezvousPath(port_, rendezvousRootOverride_);
+        writeCurrentUserOnlyRendezvous(rendezvousPath_, impl_->token, port_);
+    } catch (const std::exception& e) {
+        appLog(std::string("[server] API rendezvous unavailable: ") + e.what());
+        impl_->app.stop();
+        if (th_.joinable()) th_.join();
+        rendezvousPath_.clear();
+        releaseApiPortLease(impl_->portLease);
         return 0;
     }
     return port_;
@@ -1564,6 +2169,9 @@ void Server::stop() {
         impl_->app.stop();
         th_.join();
     }
+    removeApiRendezvousIfOwned(rendezvousPath_, impl_->token, port_);
+    releaseApiPortLease(impl_->portLease);
+    rendezvousPath_.clear();
 }
 
 } // namespace devhub

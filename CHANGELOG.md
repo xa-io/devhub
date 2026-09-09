@@ -1,39 +1,46 @@
 # Changelog
 
-Public-facing XA DevHub changes are recorded here from public repository
-preparation forward. Pre-public operator history is intentionally excluded.
+XA DevHub changes are listed newest first.
 
-## Unreleased
+## v1.0.6
 
-### Repository preparation
+### Added
 
-- Added authenticated exact project configuration reads and full-field atomic
-  project creation/update so local automation can safely populate every native
-  editor option and verify each saved record without direct database access.
-- Added an authenticated, additive-only historical ticket import that preserves
-  explicit work IDs, states and timestamps, attribution, completion events,
-  inert Discord lineage and failure acknowledgements, and hash-validated saved
-  attachments without updating or deleting existing destination tickets.
-- Added the AGPL-3.0-or-later license, dependency notices, contribution and
-  security guidance.
-- Added an explicit public-file allow-list and a static audit for private data,
-  credentials, machine-local paths, runtime data, generated files, and backups.
-- Made fresh installations start with neutral, editable project data and no
-  source-owned administrator identity or machine-specific configuration.
-- Fixed the cross-project knowledge self-test to own a dedicated retained
-  fixture instead of depending on temporary projects from another test section.
-- Verified the repair in Release v1.0.5 with all 20 CTest targets, the explicit
-  all-domain self-test, a disposable schema-v14 migration check, and restored
-  authenticated runtime health.
-- Added a user-run, non-publishing release preparation script that invokes the
-  guarded build by default and produces one explicit portable Windows x64 ZIP,
-  payload/source provenance, and SHA-256 checksums while rejecting runtime data,
-  credentials, symbols, source, and unexpected files.
-- Added end-user portable install/update/uninstall guidance and a privacy policy
-  for local project, Discord, attachment, credential, API-token, backup, and
-  export data.
-- Kept `.github`, `docs`, and `tests` as ignored maintainer-only workspaces;
-  public CMake checkouts build the application without those folders while
-  retaining the built-in disposable `devhub.exe --selftest`.
+- Capture authorized Discord mentions as credited tickets in mapped project channels, with project selection for submissions from unmapped channels.
+- Add follow-up notes and attachments to an existing ticket by replying to its original Discord message or completed capture post.
+- Merge multiple tickets from the same project while preserving their notes, contributors, attachments, and history.
+- Rename tickets and merge duplicates through the local API, with checks that prevent outdated requests from overwriting newer changes.
+- Search active Discord tickets with `!xatickets <term>` and browse matching titles with previous, next, and close controls.
+- Import historical tickets while preserving their IDs, status, dates, contributors, and attachments without overwriting existing tickets.
+- Read, create, and update complete project settings through the authenticated local API.
+- Create tickets through the local API with duplicate protection for repeated requests.
 
-No public release has been published yet.
+### Changed
+
+- Separate building, packaging, and FTP staging into three commands, with packaging requiring a verified build that matches the current source.
+- Keep FTP staging local by default and make GitHub publication an explicit option.
+- Bind local API credentials to the current Windows user and the running DevHub instance.
+- Prevent another DevHub instance from taking over the active API port or its credentials.
+
+### Fixed
+
+- Preserve dependency versions when updating the DevHub application version.
+- Close a running DevHub window gracefully during local builds, including when the window is hidden.
+- Display Discord leaderboard names without unwanted formatting characters.
+
+## v1.0.5 - Initial public source
+
+### Added
+
+- Track projects, fixes, implementations, references, and notes with priorities, due dates, contributors, attachments, and history.
+- View project activity, version information, and build pipelines from the dashboard and calendar.
+- Collect Discord feedback for review and credit contributors when feedback becomes a ticket.
+- Organize research, decisions, development workflows, and reports alongside project work.
+- Copy project context and selected tickets into AI assistants for review and implementation.
+- Provide an authenticated local API for automation.
+- Include installation, update, privacy, contribution, and security guidance.
+
+### Changed
+
+- Start new installations with an editable sample project and no preset administrator or machine-specific settings.
+- Keep project data and credentials local, with safeguards against including private files in shared source or packages.

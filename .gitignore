@@ -4,6 +4,9 @@
 /out/
 /dist/
 /release/
+/github_release/
+/ftp-upload/
+/xapr/
 /vcpkg_installed/
 CMakeUserPresets.json
 CMakeCache.txt
@@ -48,6 +51,8 @@ devhub-latest.json
 devhub-latest.md
 **/ticket-files/
 **/ticket-images/
+CHANGELOG.md
+!/CHANGELOG.md
 
 # Credentials and machine-local configuration
 .env
@@ -72,8 +77,15 @@ secrets.*.json
 /.github/
 /docs/
 /tests/
+**/tests/
+**/docs/
+/.pytest_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
 Update_*.py
 2.*.py
+3.*.py
 
 # IDE and editor state
 /.vs/

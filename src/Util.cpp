@@ -7,6 +7,7 @@
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -241,6 +242,25 @@ std::string nowIsoUtc() {
     gmtime_s(&tm, &t);
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+std::string nextIsoUtcAfter(const std::string& floor) {
+    const std::string now = nowIsoUtc();
+    if (floor.empty() || now > floor) return now;
+
+    std::tm parsed{};
+    std::istringstream input(floor);
+    input >> std::get_time(&parsed, "%Y-%m-%dT%H:%M:%SZ");
+    if (input.fail()) return now;
+    const __time64_t floorEpoch = _mkgmtime64(&parsed);
+    if (floorEpoch < 0) return now;
+
+    const __time64_t nextEpoch = floorEpoch + 1;
+    std::tm next{};
+    if (gmtime_s(&next, &nextEpoch) != 0) return now;
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &next);
     return buf;
 }
 

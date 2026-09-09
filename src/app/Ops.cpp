@@ -1,5 +1,6 @@
 #include "Ops.h"
 #include "Db.h"
+#include "DiscordIntakeOps.h"
 #include "DiscordBot.h" // notification cards (header is dpp/json-free)
 #include "PacketData.h"
 #include "PacketOps.h"
@@ -707,7 +708,7 @@ std::string compactLeaderboardDescription(
         name = trim(name);
         if (name.empty()) name = "unknown contributor";
         name = utf8Prefix(name, 80);
-        description += "**" + name + "** \xE2\x80\x94 " +
+        description += name + " \xE2\x80\x94 " +
             std::to_string(entries[i].shipped) + "/" +
             std::to_string(entries[i].submitted) + " Implemented\n";
     }
@@ -759,7 +760,7 @@ static IngestOutcome manualCaptureSuggestionLocked(
     std::string note = trim(adminNote);
     long long inferred = inferProjectLocked(held, db, content);
     if (inferred == 0) inferred = inferProjectFromChannelLocked(held, db, channelName);
-
+    const auto manual = classifyManualCaptureLocked(held, db, content);
     if (msgRow != 0) {
         out.messageRowId = msgRow;
         // A Discord delete may race an authorized reply-target fetch. The
@@ -825,7 +826,7 @@ static IngestOutcome manualCaptureSuggestionLocked(
                 "I" + std::to_string(existingItemId) + ": " +
                 std::to_string(staged.changed) + " new attachment(s)" +
                 (note.empty() ? "" : " and a follow-up note"));
-            out.kind = "suggestion";
+            out.kind = manual.kind;
             out.score = 1.0;
             appLog("[manual] appended Discord evidence to I" +
                    std::to_string(existingItemId) + " (" +
@@ -835,38 +836,38 @@ static IngestOutcome manualCaptureSuggestionLocked(
         }
         out.imageCount = stageTicketAttachmentsLocked(held,
             db, msgRow, attachments).total;
-        if (kind == "suggestion" && state == "new") {
-            // Already waiting in the inbox - just attach the note.
+        if ((kind == "suggestion" || kind == "bug") && state == "new") {
+            // Retain manual acceptance, refresh classification, attach the note.
             SQLite::Statement up(db->raw(held),
-                "UPDATE discord_messages SET content=?, admin_note=? WHERE id=?");
+                "UPDATE discord_messages SET content=?,kind=?,score=1.0,matched=?,admin_note=? WHERE id=?");
             up.bind(1, content);
-            up.bind(2, newNote);
-            up.bind(3, msgRow);
+            up.bind(2, manual.kind); up.bind(3, manual.matched);
+            up.bind(4, newNote);
+            up.bind(5, msgRow);
             up.exec();
             out.duplicate = true;
             return out;
         }
-        // Captured as none/bug or previously dismissed - upgrade to a
-        // manual suggestion back in the inbox.
+        // Return none/dismissed rows as an accepted suggestion or configured bug.
         SQLite::Statement up(db->raw(held),
-            "UPDATE discord_messages SET content=?, kind='suggestion', score=1.0, "
+            "UPDATE discord_messages SET content=?,kind=?,score=1.0, "
             "matched=?, state='new', admin_note=?, "
             "inferred_project_id=CASE WHEN inferred_project_id IS NULL "
             "AND ?>0 THEN ? ELSE inferred_project_id END WHERE id=?");
         up.bind(1, content);
-        up.bind(2, json::array({"manual"}).dump());
-        up.bind(3, newNote);
-        up.bind(4, inferred);
+        up.bind(2, manual.kind); up.bind(3, manual.matched);
+        up.bind(4, newNote);
         up.bind(5, inferred);
-        up.bind(6, msgRow);
+        up.bind(6, inferred);
+        up.bind(7, msgRow);
         up.exec();
         out.ingested = true;
     } else {
         SQLite::Statement ins(db->raw(held),
             "INSERT INTO discord_messages(channel_row_id,message_id,author,"
             "author_id,content,posted_at,ingested_at,kind,score,matched,"
-            "inferred_project_id,admin_note) VALUES(?,?,?,?,?,?,?,"
-            "'suggestion',1.0,?,?,?)");
+            "inferred_project_id,admin_note) VALUES(?,?,?,?,?,?,?,?,"
+            "1.0,?,?,?)");
         ins.bind(1, rowId);
         ins.bind(2, messageId);
         ins.bind(3, author);
@@ -874,9 +875,9 @@ static IngestOutcome manualCaptureSuggestionLocked(
         ins.bind(5, content);
         ins.bind(6, postedAt);
         ins.bind(7, nowIsoUtc());
-        ins.bind(8, json::array({"manual"}).dump());
-        if (inferred > 0) ins.bind(9, inferred); else ins.bind(9);
-        ins.bind(10, note);
+        ins.bind(8, manual.kind); ins.bind(9, manual.matched);
+        if (inferred > 0) ins.bind(10, inferred); else ins.bind(10);
+        ins.bind(11, note);
         ins.exec();
         out.messageRowId = db->raw(held).getLastInsertRowid();
         out.imageCount = stageTicketAttachmentsLocked(held,
@@ -892,9 +893,9 @@ static IngestOutcome manualCaptureSuggestionLocked(
             up.exec();
         }
     }
-    out.kind = "suggestion";
+    out.kind = manual.kind;
     out.score = 1.0;
-    appLog("[manual] suggestion captured from " + author + " in #" +
+    appLog("[manual] " + manual.kind + " captured from " + author + " in #" +
            (channelName.empty() ? channelId : channelName) +
            (note.empty() ? "" : " (with note)"));
     // The pending discord_messages row is already projected into Recent
@@ -950,19 +951,21 @@ ManualCommandStageOutcome stageManualCaptureCommand(
     int enabled = 1;
     const long long channelRow = ensureChannelRowLocked(lk.token(),
         db, channelId, channelName, guildId, guildName, &enabled);
-
+    const std::string resolvedTargetMessageId = resolvedManualCaptureTargetLocked(
+        lk.token(), db, targetMessageId);
     long long commandRow = 0;
-    std::string lifecycle;
-    std::string sourceState;
+    std::string lifecycle, sourceState, persistedTargetMessageId;
     {
         SQLite::Statement existing(db->raw(lk.token()),
-            "SELECT id,manual_command_state,state FROM discord_messages "
+            "SELECT id,manual_command_state,state,manual_target_message_id "
+            "FROM discord_messages "
             "WHERE message_id=?");
         existing.bind(1, commandMessageId);
         if (existing.executeStep()) {
             commandRow = existing.getColumn(0).getInt64();
             lifecycle = existing.getColumn(1).getString();
             sourceState = existing.getColumn(2).getString();
+            persistedTargetMessageId = existing.getColumn(3).getString();
             out.duplicate = true;
         }
     }
@@ -980,10 +983,11 @@ ManualCommandStageOutcome stageManualCaptureCommand(
         ins.bind(6, postedAt);
         ins.bind(7, nowIsoUtc());
         ins.bind(8, trim(note));
-        ins.bind(9, targetMessageId);
+        ins.bind(9, resolvedTargetMessageId);
         ins.exec();
         commandRow = db->raw(lk.token()).getLastInsertRowid();
         lifecycle = "pending";
+        persistedTargetMessageId = resolvedTargetMessageId;
     } else if (sourceState == "deleted") {
         // The command message itself was deleted while a gateway/backfill
         // callback was still in flight. Its scrubbed marker is terminal.
@@ -1001,10 +1005,11 @@ ManualCommandStageOutcome stageManualCaptureCommand(
         recover.bind(3, commandContent);
         recover.bind(4, postedAt);
         recover.bind(5, trim(note));
-        recover.bind(6, targetMessageId);
+        recover.bind(6, resolvedTargetMessageId);
         recover.bind(7, commandRow);
         recover.exec();
         lifecycle = "pending";
+        persistedTargetMessageId = resolvedTargetMessageId;
     }
 
     if (lifecycle == "pending")
@@ -1025,7 +1030,8 @@ ManualCommandStageOutcome stageManualCaptureCommand(
     out.state = lifecycle;
     out.command.commandRowId = commandRow;
     out.command.commandMessageId = commandMessageId;
-    out.command.targetMessageId = targetMessageId;
+    out.command.targetMessageId = persistedTargetMessageId.empty() ?
+        resolvedTargetMessageId : persistedTargetMessageId;
     out.command.channelId = channelId;
     out.command.channelName = channelName;
     out.command.guildId = guildId;
@@ -1067,6 +1073,17 @@ SELECT m.id,m.message_id,m.manual_target_message_id,c.channel_id,c.channel_name,
     command.note = q.getColumn(c++).getString();
     command.postedAt = q.getColumn(c++).getString();
     command.attempts = q.getColumn(c++).getInt();
+
+    const std::string resolvedTarget = resolvedManualCaptureTargetLocked(
+        lk.token(), db, command.targetMessageId);
+    if (!resolvedTarget.empty() && resolvedTarget != command.targetMessageId) {
+        SQLite::Statement updateTarget(db->raw(lk.token()),
+            "UPDATE discord_messages SET manual_target_message_id=? "
+            "WHERE id=? AND manual_command_state='pending' AND manual_target_message_id=?");
+        updateTarget.bind(1, resolvedTarget); updateTarget.bind(2, command.commandRowId);
+        updateTarget.bind(3, command.targetMessageId);
+        if (updateTarget.exec() == 1) command.targetMessageId = resolvedTarget;
+    }
 
     SQLite::Statement images(db->raw(lk.token()),
         "SELECT attachment_id,source_channel_id,source_message_id,source_role,"
@@ -1177,6 +1194,17 @@ IngestOutcome completeManualCaptureCommand(
         command.guildName, command.targetMessageId, targetAuthor,
         targetAuthorId, targetContent, targetPostedAt, command.note,
         targetAttachments);
+    // Hand off contributor identity only while marking a direct command done.
+    if (command.commandMessageId == command.targetMessageId &&
+        out.messageRowId > 0 && !targetAuthorId.empty()) {
+        SQLite::Statement contributor(db->raw(lk.token()),
+            "UPDATE discord_messages SET author=?,author_id=? WHERE id=? "
+            "AND state='new' AND manual_command_state='pending'");
+        contributor.bind(1, targetAuthor);
+        contributor.bind(2, targetAuthorId);
+        contributor.bind(3, out.messageRowId);
+        contributor.exec();
+    }
     const std::string resultKind = out.appendedToItem
         ? "appended" : (out.ingested ? "captured" : "repeat");
     SQLite::Statement done(db->raw(lk.token()),
@@ -1338,46 +1366,6 @@ bool completeManualCaptureEffect(Db* db, long long commandRowId, int attempt) {
     done.bind(2, commandRowId);
     done.bind(3, attempt);
     return done.exec() == 1;
-}
-
-std::vector<TicketMenuEntry> ticketMenuProjects(Db* db) {
-    std::vector<TicketMenuEntry> out;
-    auto lk = db->guard();
-    SQLite::Statement q(db->raw(lk.token()),
-        "SELECT p.id, p.name, COUNT(i.id) "
-        "FROM projects p "
-        "JOIN items i ON i.project_id=p.id "
-        " AND i.status IN ('open','in_progress','blocked') "
-        " AND i.type IN ('fix','implementation') "
-        "WHERE p.archived=0 AND p.discord_tickets=1 "
-        "GROUP BY p.id, p.name HAVING COUNT(i.id)>0 "
-        "ORDER BY p.name COLLATE NOCASE");
-    while (q.executeStep()) {
-        TicketMenuEntry e;
-        e.projectId = q.getColumn(0).getInt64();
-        e.name = q.getColumn(1).getString();
-        e.openCount = q.getColumn(2).getInt();
-        out.push_back(std::move(e));
-    }
-    return out;
-}
-
-std::vector<TicketLine> ticketTitlesForProject(Db* db, long long projectId) {
-    std::vector<TicketLine> out;
-    auto lk = db->guard();
-    SQLite::Statement q(db->raw(lk.token()),
-        "SELECT type, title FROM items WHERE project_id=? "
-        "AND status IN ('open','in_progress','blocked') "
-        "AND type IN ('fix','implementation') "
-        "ORDER BY CASE type WHEN 'fix' THEN 0 ELSE 1 END, id");
-    q.bind(1, projectId);
-    while (q.executeStep()) {
-        TicketLine t;
-        t.type = q.getColumn(0).getString();
-        t.title = q.getColumn(1).getString();
-        out.push_back(std::move(t));
-    }
-    return out;
 }
 
 void discordMessageDeleted(Db* db, DiscordBot* bot,

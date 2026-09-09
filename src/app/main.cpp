@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
         BuildRunner builds(&db);
         VersionChecker versions(&db);
         DiscordBot discord(&db);
-        Server server(&db, &builds, port, dataDir);
+        Server server(&db, &builds, port);
         server.discordStatus = [&discord]() {
             DiscordBot::Status s = discord.status();
             return nlohmann::json{{"state", s.state},

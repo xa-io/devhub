@@ -61,10 +61,25 @@ bool setItemSourceCreditedLocked(Db::Held held, Db* db, long long itemId, long l
 bool mergeSourcesLocked(Db::Held held, Db* db, long long sourceId, long long targetSourceId,
                         std::string& error);
 
-// Consolidates duplicate feedback without losing either item or contributor.
-// The source item becomes an audit-only `merged` record linked to the target.
+// Consolidates duplicate feedback without losing any item or contributor. The
+// full source set is validated before one transaction appends its notes and
+// moves its evidence to the target; every source remains an audit-only
+// `merged` record linked to that target.
+bool mergeItemsLocked(Db::Held held, Db* db,
+                      const std::vector<long long>& sourceItemIds,
+                      long long targetItemId, std::string& error,
+                      DiscordBot* bot = nullptr);
+
+// Compatibility wrapper for existing one-source callers.
 bool mergeItemsLocked(Db::Held held, Db* db, long long sourceItemId, long long targetItemId,
-                      std::string& error);
+                      std::string& error, DiscordBot* bot = nullptr);
+
+// Marks every posted notification card for an item as needing a fresh
+// composition. Call this inside the owning item transaction so title and
+// merge mutations cannot commit without their durable card revision.
+void updateNotifyCardForItemLocked(Db::Held held, Db* db, DiscordBot* bot,
+                                   long long itemId,
+                                   const std::string& status);
 
 // Saves the native item editor as one transaction. A changed project keeps the
 // global item ID and item-linked evidence, moves its completion event, and lets

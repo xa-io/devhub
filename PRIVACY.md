@@ -14,8 +14,7 @@ By default, DevHub stores runtime data in the `data` folder beside
 - contributor names, stable Discord identities, message metadata, and review
   state;
 - saved ticket attachments and their untrusted original display names;
-- build output logs, portable exports, database backups, and a per-process API
-  token; and
+- build output logs, portable exports, and database backups; and
 - credentials configured by the operator. Credential-shaped settings are
   protected at rest with Windows DPAPI for the current Windows profile.
 
@@ -39,10 +38,13 @@ data those services retain independently.
 
 ## Local automation API
 
-The automation API binds to loopback and rotates a random per-process token in
-the selected data directory. The token is required for API requests and should
-never be copied into source, logs, issues, or release packages. Changing the
-port does not make the API appropriate for public network exposure.
+The automation API binds to loopback. After acquiring the selected port, DevHub
+rotates a random per-process token and atomically publishes an exact-instance
+rendezvous under the current Windows profile's non-roaming LocalAppData. That
+current-user-only record binds the canonical loopback origin, process ID, and
+token. The token is required for every API request and should never be copied
+into source, logs, issues, or release packages. Changing the port does not make
+the API appropriate for public network exposure.
 
 ## Backups, retention, and deletion
 
@@ -66,5 +68,4 @@ Before sharing a screenshot, log excerpt, export, database, or reproduction:
 3. use the private security-reporting route in `SECURITY.md` for a
    vulnerability.
 
-This document describes XA DevHub v1.0.5. Material privacy behavior changes are
-recorded in `CHANGELOG.md`.
+This document describes XA DevHub v1.0.6. Material privacy behavior changes are recorded in `CHANGELOG.md`.

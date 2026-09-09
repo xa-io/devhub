@@ -163,6 +163,9 @@ private:
     // reactions endpoint rate-limits hard when adds go out concurrently.
     void seedTicketReactions(uint64_t msgId, uint64_t chanId, size_t idx,
                              size_t count, int retriesLeft);
+    void seedTicketSearchReactions(uint64_t msgId, uint64_t chanId,
+                                   size_t idx, size_t pageCount,
+                                   int retriesLeft);
     void recoverPendingReviewReactions();
     struct ReviewReactionTask {
         uint64_t taskId = 0;
@@ -253,6 +256,16 @@ private:
     std::mutex menusMu_;
     std::map<uint64_t, std::vector<std::pair<long long, std::string>>>
         ticketMenus_;
+    struct TicketSearchMenu {
+        std::string query;
+        std::vector<std::string> pages;
+        size_t page = 0;
+        size_t shownMatches = 0;
+        size_t totalMatches = 0;
+    };
+    // !xatickets searches this session: bounded and non-persistent like the
+    // project menus. Pages contain title-only projections, never ticket bodies.
+    std::map<uint64_t, TicketSearchMenu> ticketSearchMenus_;
 
     // Notification-card reaction work. Pending control seeding and terminal
     // all-reaction cleanup share one lane so an in-flight add cannot win after

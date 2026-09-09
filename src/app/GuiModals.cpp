@@ -670,6 +670,7 @@ void drawModals(App& a) {
                 a.editItemId = 0;
                 a.editItemProjectId = 0;
                 a.eiProjectId = 0;
+                a.eiMergeSourceIds.clear();
                 a.needItems = true;
                 a.needProjects = true;
                 a.needWork = true;
@@ -688,48 +689,80 @@ void drawModals(App& a) {
             a.editItemId = 0;
             a.editItemProjectId = 0;
             a.eiProjectId = 0;
+            a.eiMergeSourceIds.clear();
             ImGui::CloseCurrentPopup();
         }
 
-        std::vector<Item*> mergeTargets;
-        for (auto& candidate : a.items)
-            if (candidate.id != a.editItemId && activeItemStatus(candidate.status))
-                mergeTargets.push_back(&candidate);
-        if (!mergeTargets.empty()) {
-            ImGui::SeparatorText("Merge duplicate feedback");
-            const char* preview = a.eiMergeTarget >= 0 &&
-                                  a.eiMergeTarget < (int)mergeTargets.size()
-                                      ? mergeTargets[a.eiMergeTarget]->title.c_str()
-                                      : "choose the item to keep";
-            ImGui::SetNextItemWidth(410);
-            if (ImGui::BeginCombo("##mergeTarget", preview)) {
-                for (int i = 0; i < (int)mergeTargets.size(); ++i)
-                    if (ImGui::Selectable(mergeTargets[i]->title.c_str(),
-                                          a.eiMergeTarget == i))
-                        a.eiMergeTarget = i;
-                ImGui::EndCombo();
+        Item* mergeTarget = nullptr;
+        std::vector<Item*> mergeSources;
+        for (auto& candidate : a.items) {
+            if (candidate.id == a.editItemId) {
+                mergeTarget = &candidate;
+            } else if (candidate.projectId == a.editItemProjectId &&
+                       candidate.status != "merged") {
+                mergeSources.push_back(&candidate);
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Merge into selected") && a.eiMergeTarget >= 0) {
+        }
+        if (mergeTarget && activeItemStatus(mergeTarget->status) &&
+            !mergeSources.empty()) {
+            ImGui::SeparatorText("Merge tickets into this one");
+            ImGui::TextWrapped(
+                "Select same-project tickets to merge into active I%lld. Saved titles and "
+                "notes are appended in one transaction; contributors, Discord "
+                "lineage, and attachments move with them. Save text edits first.",
+                a.editItemId);
+            const float sourceListHeight = std::min(
+                180.0f, 10.0f + 28.0f * static_cast<float>(mergeSources.size()));
+            ImGui::BeginChild("##mergeSources", ImVec2(0, sourceListHeight),
+                              ImGuiChildFlags_Borders);
+            for (Item* candidate : mergeSources) {
+                bool selected = a.eiMergeSourceIds.count(candidate->id) != 0;
+                const std::string checkboxId =
+                    "##mergeSource" + std::to_string(candidate->id);
+                if (ImGui::Checkbox(checkboxId.c_str(), &selected)) {
+                    if (selected)
+                        a.eiMergeSourceIds.insert(candidate->id);
+                    else
+                        a.eiMergeSourceIds.erase(candidate->id);
+                }
+                ImGui::SameLine();
+                const std::string label = "I" + std::to_string(candidate->id) +
+                    "  [" + candidate->status + "]  " + candidate->title;
+                ImGui::TextWrapped("%s", label.c_str());
+            }
+            ImGui::EndChild();
+
+            std::vector<long long> selectedSourceIds;
+            for (const Item* candidate : mergeSources)
+                if (a.eiMergeSourceIds.count(candidate->id) != 0)
+                    selectedSourceIds.push_back(candidate->id);
+            const std::string mergeLabel = "Merge " +
+                std::to_string(selectedSourceIds.size()) + " selected into I" +
+                std::to_string(a.editItemId);
+            if (selectedSourceIds.empty()) ImGui::BeginDisabled();
+            if (ImGui::Button(mergeLabel.c_str()) && !selectedSourceIds.empty()) {
                 std::string error;
                 bool ok;
-                const long long mergeTargetId =
-                    mergeTargets[a.eiMergeTarget]->id;
+                const long long mergeTargetId = a.editItemId;
                 {
                     auto lk = a.db->guard();
-                    ok = mergeItemsLocked(lk.token(), a.db, a.editItemId,
-                                          mergeTargetId, error);
+                    ok = mergeItemsLocked(lk.token(), a.db, selectedSourceIds,
+                                          mergeTargetId, error, a.discord);
                 }
                 if (ok) {
-                    // Card rows move inside the merge transaction; compose the
-                    // combined image counts/status after releasing the DB guard.
-                    refreshTicketNotifyCard(a.db, a.discord, mergeTargetId);
                     a.editItemId = 0;
+                    a.editItemProjectId = 0;
+                    a.eiProjectId = 0;
+                    a.eiMergeSourceIds.clear();
                     a.needItems = a.needProjects = a.needSources = a.needWork = true;
-                    toast(a, "feedback merged; contributors preserved");
+                    a.needCal = true;
+                    a.ticketCache.clear();
+                    toast(a, std::to_string(selectedSourceIds.size()) +
+                        " tickets merged; notes, contributors, and evidence preserved");
                     ImGui::CloseCurrentPopup();
                 } else toast(a, error, true);
             }
+            if (selectedSourceIds.empty()) ImGui::EndDisabled();
         }
         ImGui::EndPopup();
     }

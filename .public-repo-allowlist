@@ -3,7 +3,6 @@
 /.gitignore
 /.public-repo-allowlist
 /1. build.py
-/2. Prepare_release.py
 /CMakeLists.txt
 /CHANGELOG.md
 /CONTRIBUTING.md
@@ -13,7 +12,6 @@
 /README.md
 /SECURITY.md
 /THIRD_PARTY_NOTICES.md
-/Update_Version.py
 /vcpkg-configuration.json
 /vcpkg.json
 
@@ -21,5 +19,8 @@
 /include/
 /src/
 /third_party/licenses/
-/tools/
+/tools/audit_public_repo.ps1
+/tools/make_icon.ps1
+/tools/release_receipt.py
+/tools/devhub-control/devhub.ps1
 /vcpkg-overlays/

@@ -25,6 +25,7 @@
 #include <windows.h> // after dpp (WIN32_LEAN_AND_MEAN keeps winsock1 out)
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
@@ -36,6 +37,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 namespace devhub {
@@ -69,6 +71,44 @@ static uint64_t snowflakeFromIso(const std::string& iso) {
 
 static std::string displayName(const dpp::user& u) {
     return u.global_name.empty() ? u.username : u.global_name;
+}
+
+static std::pair<std::string, std::string> directCaptureContributor(
+    const dpp::message& message, uint64_t botUserId,
+    const std::string& fallbackName, const std::string& fallbackId) {
+    // Read mention tokens from message content so "first" means visible
+    // left-to-right order, then accept only a user Discord included in its
+    // validated mentions collection. The bot and other bots are never credit.
+    std::size_t cursor = 0;
+    while ((cursor = message.content.find("<@", cursor)) !=
+           std::string::npos) {
+        std::size_t digits = cursor + 2;
+        if (digits < message.content.size() && message.content[digits] == '!')
+            ++digits;
+        std::size_t end = digits;
+        while (end < message.content.size() &&
+               message.content[end] >= '0' && message.content[end] <= '9')
+            ++end;
+        if (end > digits && end < message.content.size() &&
+            message.content[end] == '>') {
+            try {
+                const uint64_t mentionedId = std::stoull(
+                    message.content.substr(digits, end - digits));
+                if (mentionedId != botUserId) {
+                    for (const auto& [user, member] : message.mentions) {
+                        if ((uint64_t)user.id == mentionedId && !user.is_bot())
+                            return {displayName(user),
+                                    std::to_string(mentionedId)};
+                    }
+                }
+            } catch (...) {
+                // Discord supplied malformed visible mention text; continue
+                // to another validated mention or the admin fallback.
+            }
+        }
+        cursor = end > cursor ? end : cursor + 2;
+    }
+    return {fallbackName, fallbackId};
 }
 
 static std::string responseContentType(
@@ -550,13 +590,18 @@ void DiscordBot::handleMessageUpdate(const void* msgPtr) {
 
 // Remove every <@id> / <@!id> mention of the bot from the reply; what
 // remains (trimmed) is the admin's note.
-static std::string stripBotMention(std::string s, uint64_t botId) {
-    const std::string id = std::to_string(botId);
+static std::string stripDiscordUserMention(
+    std::string s, const std::string& userId) {
+    const std::string id = userId;
     for (const std::string& tok : {"<@!" + id + ">", "<@" + id + ">"}) {
         size_t pos;
         while ((pos = s.find(tok)) != std::string::npos) s.erase(pos, tok.size());
     }
     return trim(s);
+}
+
+static std::string stripBotMention(std::string s, uint64_t botId) {
+    return stripDiscordUserMention(std::move(s), std::to_string(botId));
 }
 
 bool DiscordBot::maybeNotifyCardReviewReply(const void* msgPtr) {
@@ -682,14 +727,29 @@ void DiscordBot::reconcileManualCaptureEffect(
             if (effect.messageRowId <= 0)
                 throw std::runtime_error(
                     "completed capture has no persisted target row");
-            // notifyDetection now stages a durable outbox receipt. Repeating
-            // this after a crash is safe and never creates a second lineage.
-            notifyDetection(
-                db_, this, effect.messageRowId, effect.guildId,
-                effect.channelId, effect.channelName, effect.targetMessageId,
-                effect.targetAuthor, effect.targetContent,
-                effect.targetKind.empty() ? "suggestion" : effect.targetKind,
-                effect.targetScore);
+            const bool direct = effect.commandMessageId ==
+                                effect.targetMessageId;
+            MappedManualPromotionOutcome promotion;
+            if (direct)
+                promotion = promoteMappedManualCapture(
+                    db_, this, effect.messageRowId);
+            if (promotion.mapped) {
+                if (!promotion.ok)
+                    throw std::runtime_error(
+                        "mapped direct capture promotion failed: " +
+                        promotion.error);
+            } else {
+                // Common/unmapped channels keep the existing approval inbox.
+                // Repeating this after a crash never creates second lineage.
+                notifyDetection(
+                    db_, this, effect.messageRowId, effect.guildId,
+                    effect.channelId, effect.channelName,
+                    effect.targetMessageId, effect.targetAuthor,
+                    effect.targetContent,
+                    effect.targetKind.empty() ? "suggestion"
+                                              : effect.targetKind,
+                    effect.targetScore);
+            }
         } else if (effect.resultKind == "appended") {
             if (effect.itemId <= 0)
                 throw std::runtime_error(
@@ -830,6 +890,11 @@ bool DiscordBot::maybeManualCapture(const void* msgPtr) {
     const std::string stripped = stripBotMention(m.content, me);
     const std::string adminName = displayName(m.author);
     const std::string commandId = std::to_string((uint64_t)m.id);
+    const auto directContributor = directCaptureContributor(
+        m, me, adminName, authorId);
+    const std::string directContent = directContributor.second == authorId
+        ? stripped
+        : stripDiscordUserMention(stripped, directContributor.second);
     const std::string targetId = isReply
         ? std::to_string((uint64_t)m.message_reference.message_id)
         : commandId;
@@ -882,7 +947,7 @@ bool DiscordBot::maybeManualCapture(const void* msgPtr) {
             return true;
         }
         const uint64_t generation = manualCaptureGeneration_.load();
-        std::string content = stripped;
+        std::string content = directContent;
         if (content.empty() && !staged.command.commandAttachments.empty())
             content = "File attachment submitted from Discord";
         if (content.empty()) {
@@ -896,7 +961,8 @@ bool DiscordBot::maybeManualCapture(const void* msgPtr) {
         }
         try {
             completeManualCaptureTarget(
-                staged.command, adminName, authorId, content,
+                staged.command, directContributor.first,
+                directContributor.second, content,
                 isoFromSnowflake((uint64_t)m.id),
                 staged.command.commandAttachments, generation);
         } catch (const std::exception& e) {
@@ -1104,11 +1170,22 @@ void DiscordBot::pumpManualCapture() {
                                         command.commandMessageId;
                     std::vector<DiscordAttachmentMeta> images;
                     std::string content;
+                    std::string targetAuthor = displayName(target.author);
+                    std::string targetAuthorId =
+                        std::to_string((uint64_t)target.author.id);
                     if (direct) {
                         // This attachment metadata was staged from the live
                         // command and retains its direct_ping provenance.
                         images = command.commandAttachments;
                         content = stripBotMention(target.content, botUserId);
+                        const auto contributor = directCaptureContributor(
+                            target, botUserId, targetAuthor, targetAuthorId);
+                        targetAuthor = contributor.first;
+                        targetAuthorId = contributor.second;
+                        if (targetAuthorId !=
+                            std::to_string((uint64_t)target.author.id))
+                            content = stripDiscordUserMention(
+                                content, targetAuthorId);
                     } else {
                         images = attachmentMetadata(target, "suggestion");
                         images.insert(images.end(),
@@ -1134,8 +1211,7 @@ void DiscordBot::pumpManualCapture() {
                     if (manualCaptureGeneration_.load() != generation)
                         return;
                     completeManualCaptureTarget(
-                        command, displayName(target.author),
-                        std::to_string((uint64_t)target.author.id), content,
+                        command, targetAuthor, targetAuthorId, content,
                         isoFromSnowflake((uint64_t)target.id), images,
                         generation);
                 } catch (const std::exception& e) {
@@ -1470,6 +1546,16 @@ static const char* kKeycaps[10] = {
     "9\xEF\xB8\x8F\xE2\x83\xA3", "\xF0\x9F\x94\x9F"};
 // Seeded last: the admin clicks it to delete the menu card.
 static const char* kXEmoji = "\xE2\x9D\x8C";
+static const char* kSearchPreviousEmoji =
+    "\xE2\xAC\x85\xEF\xB8\x8F";
+static const char* kSearchPreviousEmojiWithoutVariation = "\xE2\xAC\x85";
+static const char* kSearchNextEmoji =
+    "\xE2\x9E\xA1\xEF\xB8\x8F";
+static const char* kSearchNextEmojiWithoutVariation = "\xE2\x9E\xA1";
+static constexpr size_t kTicketSearchPageSize = 20;
+static constexpr size_t kTicketSearchTitleCharacters = 50;
+static constexpr size_t kTicketSearchMaxResults = 500;
+static constexpr size_t kTicketSearchMaxQueryBytes = 200;
 static const char* kHighApproveEmoji =
     "\xE2\x9A\xA0\xEF\xB8\x8F"; // warning + VS16
 static const char* kHighApproveEmojiWithoutVariation = "\xE2\x9A\xA0";
@@ -1501,6 +1587,16 @@ static int keycapIndex(const std::string& name) {
     return -1;
 }
 
+static int ticketSearchDirection(const std::string& name) {
+    if (name == kSearchPreviousEmoji ||
+        name == kSearchPreviousEmojiWithoutVariation)
+        return -1;
+    if (name == kSearchNextEmoji ||
+        name == kSearchNextEmojiWithoutVariation)
+        return 1;
+    return 0;
+}
+
 // Menu numbers as a compact field so the mapping stays visible on the
 // per-project ticket view.
 static std::string menuFieldText(
@@ -1511,14 +1607,48 @@ static std::string menuFieldText(
     return s;
 }
 
+static NotifyCard ticketSearchCard(
+    const std::string& query, const std::vector<std::string>& pages,
+    size_t page, size_t shownMatches, size_t totalMatches) {
+    NotifyCard card;
+    card.title = "\xF0\x9F\x8E\xAB Tickets containing \"" +
+                 ticketSearchTitlePreview(query, 80) + "\" (" +
+                 std::to_string(totalMatches) + ")";
+    card.footer = DEVHUB_APP_NAME;
+    if (pages.empty()) {
+        card.description = "no active opted-in tickets contain that search term";
+        return card;
+    }
+    const size_t boundedPage = std::min(page, pages.size() - 1);
+    card.description = pages[boundedPage];
+    card.footer += " | page " + std::to_string(boundedPage + 1) + "/" +
+                   std::to_string(pages.size());
+    if (shownMatches < totalMatches)
+        card.footer += " | showing first " + std::to_string(shownMatches);
+    if (pages.size() > 1)
+        card.description +=
+            "\nuse left/right arrows to change page - \xE2\x9D\x8C closes";
+    return card;
+}
+
 bool DiscordBot::maybeTicketsCommand(const void* msgPtr, bool liveEvent) {
     const dpp::message& m = *static_cast<const dpp::message*>(msgPtr);
     if (!lockCluster()) return false;
     // "!tickets" = interactive menu with reaction paging;
-    // "!xatickets" = plain numbered summary, no reactions, no drill-down.
-    const std::string cmd = toLower(trim(m.content));
+    // "!xatickets" = plain summary; "!xatickets term" = title/body search.
+    const std::string rawCommand = trim(m.content);
+    const std::string cmd = toLower(rawCommand);
     const bool interactive = cmd == "!tickets";
-    if (!interactive && cmd != "!xatickets") return false;
+    const bool summary = cmd == "!xatickets";
+    static constexpr std::string_view kSearchPrefix = "!xatickets";
+    std::string searchQuery;
+    if (!summary && cmd.size() > kSearchPrefix.size() &&
+        cmd.compare(0, kSearchPrefix.size(), kSearchPrefix) == 0 &&
+        std::isspace(static_cast<unsigned char>(
+            rawCommand[kSearchPrefix.size()])))
+        searchQuery = trim(rawCommand.substr(kSearchPrefix.size()));
+    const bool search = !searchQuery.empty();
+    if (!interactive && !summary && !search) return false;
 
     // Admin-only. Anyone else typing "!tickets" is just chatting.
     const std::string authorId = std::to_string((uint64_t)m.author.id);
@@ -1545,8 +1675,6 @@ bool DiscordBot::maybeTicketsCommand(const void* msgPtr, bool liveEvent) {
     // above prevents a later replay, while skipping all post/delete effects.
     if (!liveEvent) return true;
 
-    std::vector<TicketMenuEntry> entries = ticketMenuProjects(db_);
-
     // The card replaces the command - once it posts, the admin's "!tickets"
     // message is removed (theirs ONLY, and only because they asked for the
     // menu; nobody else's messages are ever touched).
@@ -1564,6 +1692,60 @@ bool DiscordBot::maybeTicketsCommand(const void* msgPtr, bool liveEvent) {
                            cc.get_error().message);
             });
     };
+
+    if (search) {
+        if (searchQuery.size() > kTicketSearchMaxQueryBytes) {
+            NotifyCard card;
+            card.title = "\xF0\x9F\x8E\xAB Ticket search";
+            card.description = "search term is too long";
+            card.color = 0xf85149;
+            card.footer = DEVHUB_APP_NAME;
+            postCard(chanId, card,
+                     [deleteCommand](const std::string&) { deleteCommand(); });
+            return true;
+        }
+
+        TicketSearchResult result = searchActiveTicketTitles(
+            db_, searchQuery, kTicketSearchMaxResults);
+        TicketSearchMenu menu;
+        menu.query = searchQuery;
+        menu.pages = ticketSearchPages(
+            result.entries, kTicketSearchPageSize,
+            kTicketSearchTitleCharacters);
+        menu.shownMatches = result.entries.size();
+        menu.totalMatches = result.totalMatches;
+        NotifyCard card = ticketSearchCard(
+            menu.query, menu.pages, menu.page,
+            menu.shownMatches, menu.totalMatches);
+        if (menu.pages.empty()) {
+            postCard(chanId, card,
+                     [deleteCommand](const std::string&) { deleteCommand(); });
+        } else {
+            const size_t pageCount = menu.pages.size();
+            postCard(chanId, card,
+                 [this, chan, pageCount, menu = std::move(menu),
+                  deleteCommand](const std::string& mid) mutable {
+                     const uint64_t menuId =
+                         std::strtoull(mid.c_str(), nullptr, 10);
+                     if (menuId == 0 || !lockCluster()) return;
+                     {
+                         std::lock_guard<std::mutex> lk(menusMu_);
+                         ticketSearchMenus_[menuId] = std::move(menu);
+                         while (ticketSearchMenus_.size() > 8)
+                             ticketSearchMenus_.erase(
+                                 ticketSearchMenus_.begin());
+                     }
+                     deleteCommand();
+                     seedTicketSearchReactions(
+                         menuId, chan, 0, pageCount, /*retriesLeft=*/2);
+                 });
+        }
+        appLog("[tickets] search returned " +
+               std::to_string(result.totalMatches) + " active match(es)");
+        return true;
+    }
+
+    std::vector<TicketMenuEntry> entries = ticketMenuProjects(db_);
 
     NotifyCard card;
     card.title = "\xF0\x9F\x8E\xAB Open tickets";
@@ -1647,6 +1829,40 @@ void DiscordBot::seedTicketReactions(uint64_t msgId, uint64_t chanId,
             std::this_thread::sleep_for(std::chrono::milliseconds(350));
             seedTicketReactions(msgId, chanId, idx + 1, count,
                                 /*retriesLeft=*/2);
+        });
+}
+
+void DiscordBot::seedTicketSearchReactions(
+    uint64_t msgId, uint64_t chanId, size_t idx, size_t pageCount,
+    int retriesLeft) {
+    const std::shared_ptr<dpp::cluster> cluster = lockCluster();
+    if (!cluster || pageCount == 0) return;
+    const size_t reactionCount = pageCount > 1 ? 3 : 1;
+    if (idx >= reactionCount) return;
+    const char* emoji = kXEmoji;
+    if (pageCount > 1 && idx == 0) emoji = kSearchPreviousEmoji;
+    else if (pageCount > 1 && idx == 1) emoji = kSearchNextEmoji;
+    cluster->message_add_reaction(
+        dpp::snowflake(msgId), dpp::snowflake(chanId), emoji,
+        [this, cluster, msgId, chanId, idx, pageCount, retriesLeft]
+        (const dpp::confirmation_callback_t& response) {
+            if (!lockCluster()) return;
+            if (response.is_error()) {
+                if (retriesLeft > 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(900));
+                    seedTicketSearchReactions(
+                        msgId, chanId, idx, pageCount, retriesLeft - 1);
+                    return;
+                }
+                appLog("[tickets] search reaction " +
+                       std::to_string(idx + 1) + " failed: " +
+                       response.get_error().message);
+            }
+            if (idx + 1 >= (pageCount > 1 ? 3u : 1u)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+            seedTicketSearchReactions(
+                msgId, chanId, idx + 1, pageCount, /*retriesLeft=*/2);
         });
 }
 
@@ -2080,8 +2296,10 @@ void DiscordBot::handleReaction(const void* evPtr) {
         return;
     // Pure in-memory disqualifiers come before the per-reaction SQLite admin
     // lookup. Unrelated remote reactions must not be able to schedule DB work.
+    const int searchDirection =
+        ticketSearchDirection(ev.reacting_emoji.name);
     if (reviewApprovalPriority(ev.reacting_emoji.name) < 0 &&
-        keycapIndex(ev.reacting_emoji.name) < 0)
+        keycapIndex(ev.reacting_emoji.name) < 0 && searchDirection == 0)
         return;
     // Only whitelisted admins/developers drive menus; other reactions are inert.
     if (!discordAdminUserAllowed(
@@ -2132,6 +2350,55 @@ void DiscordBot::handleReaction(const void* evPtr) {
             }
             return;
         }
+    }
+
+    TicketSearchMenu searchMenu;
+    bool searchMatched = false;
+    bool closeSearch = false;
+    {
+        std::lock_guard<std::mutex> lk(menusMu_);
+        auto it = ticketSearchMenus_.find((uint64_t)ev.message_id);
+        if (it != ticketSearchMenus_.end()) {
+            if (ev.reacting_emoji.name == kXEmoji) {
+                searchMatched = true;
+                ticketSearchMenus_.erase(it);
+                closeSearch = true;
+            } else if (searchDirection != 0) {
+                searchMatched = true;
+                if (searchDirection < 0 && it->second.page > 0)
+                    --it->second.page;
+                else if (searchDirection > 0 &&
+                         it->second.page + 1 < it->second.pages.size())
+                    ++it->second.page;
+                searchMenu = it->second;
+            }
+        }
+    }
+    if (searchMatched) {
+        if (closeSearch) {
+            cluster->message_delete(ev.message_id, ev.channel_id);
+            appLog("[tickets] search closed");
+            return;
+        }
+        // Reset the arrow so the same admin can keep paging with one click.
+        cluster->message_delete_reaction(
+            ev.message_id, ev.channel_id, ev.reacting_user.id,
+            ev.reacting_emoji.name,
+            [](const dpp::confirmation_callback_t& response) {
+                if (response.is_error())
+                    appLog("[tickets] couldn't reset search reaction (needs "
+                           "Manage Messages): " +
+                           response.get_error().message);
+            });
+        NotifyCard card = ticketSearchCard(
+            searchMenu.query, searchMenu.pages, searchMenu.page,
+            searchMenu.shownMatches, searchMenu.totalMatches);
+        editCard(std::to_string((uint64_t)ev.channel_id),
+                 std::to_string((uint64_t)ev.message_id), card);
+        appLog("[tickets] search page " +
+               std::to_string(searchMenu.page + 1) + "/" +
+               std::to_string(searchMenu.pages.size()));
+        return;
     }
 
     std::vector<std::pair<long long, std::string>> menu;

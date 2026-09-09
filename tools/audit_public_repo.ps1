@@ -3,10 +3,11 @@ param(
     [string]$RepoRoot = ''
 )
 
-# XA DevHub Public Repository Audit v1.01
+# XA DevHub Public Repository Audit v1.02
 # Verifies the exact tracked/unignored candidate tree before public release.
 # Created by: XA DevHub contributors
-# Last Updated: 2026-08-12 13:31:00
+# Last Updated: 2026-09-08 16:30:00
+# v1.02 - Keep operator release helpers private and reject nested tests/docs and linked candidates.
 #
 # This check is intentionally static. It does not build, package, upload, push,
 # change repository visibility, or inspect ignored runtime/backup content.
@@ -89,7 +90,7 @@ foreach ($line in Get-Content -LiteralPath $allowlistPath) {
 
 $required = @(
     '.gitattributes', '.gitignore', '.public-repo-allowlist',
-    '1. build.py', '2. Prepare_release.py',
+    '1. build.py', 'tools/release_receipt.py',
     'CHANGELOG.md', 'CONTRIBUTING.md', 'LICENSE', 'NOTICE',
     'PRIVACY.md', 'README.md', 'SECURITY.md', 'THIRD_PARTY_NOTICES.md'
 )
@@ -100,7 +101,7 @@ foreach ($path in $required) {
 }
 
 $forbiddenPathPattern = [regex]::new(
-    '(?i)(^|/)(?:data|backups?|build(?:-[^/]*)?|vcpkg_installed|\.vs|\.vscode|\.idea|\.claude-octopus|local-only)(/|$)|' +
+    '(?i)(^|/)(?:data|docs|tests|xapr|release|github_release|ftp-upload|backups?|build(?:-[^/]*)?|vcpkg_installed|\.vs|\.vscode|\.idea|\.claude-octopus|local-only)(/|$)|' +
     '(?:^|/)(?:api-token|credentials\.json|secrets(?:\.[^/]*)?\.json)$|' +
     '\.(?:db|db-wal|db-shm|sqlite|sqlite3|log|dmp|dump|pem|key|pfx|p12|user|suo|pyc)$'
 )
@@ -153,6 +154,19 @@ foreach ($path in $candidates) {
     }
 
     $absolute = Join-Path $repo ($path.Replace('/', '\'))
+    $cursorPath = $absolute
+    $linked = $false
+    while ($cursorPath -and $cursorPath -ne $repo) {
+        $cursor = Get-Item -LiteralPath $cursorPath -Force -ErrorAction SilentlyContinue
+        if ($null -eq $cursor) { break }
+        if ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Add-Failure "Linked/reparse candidate is public: $path"
+            $linked = $true
+            break
+        }
+        $cursorPath = Split-Path -Parent $cursorPath
+    }
+    if ($linked) { continue }
     if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
         Add-Failure "Candidate file is missing from the worktree: $path"
         continue
@@ -214,6 +228,9 @@ $ignoreProbes = @(
     'src/app/backups/source.cpp', '.env', 'local-only/operator.md',
     '.github/workflows/ci.yml', 'docs/RELEASE-WORKFLOW.md',
     'tests/test_core.cpp',
+    'tools/devhub-control/tests/private.ps1', 'tools/docs/operator.md',
+    '2. Prepare_release.py', '3. Push_release.py', 'xapr/config.json',
+    'ftp-upload/downloads/xa-devhub/latest.json', 'github_release/receipt.json',
     'devhub-latest.json', 'devhub-export-20260812.md',
     'ticket-files/I1/private.bin', 'release-package.zip'
 )

@@ -20,13 +20,16 @@
 #
 # Important Note: This script never deletes build\, because build\Release\data contains DevHub's live SQLite data.
 #
-# XA DevHub Build v1.11
+# XA DevHub Build v1.14
 # Production build, test, and safe process-state wrapper for XA DevHub.
 # Created by: XA
-# Last Updated: 2026-08-12 13:31:00
+# Last Updated: 2026-09-08 16:30:00
 #
 # ## Release Notes ##
 #
+# v1.14 - Record exact inputs and runtime hashes after successful builds for separate release packaging.
+# v1.13 - Gracefully close exact DevHub native windows even when Windows reports them hidden.
+# v1.12 - Resolve authenticated health through the exact LocalAppData instance rendezvous.
 # v1.11 - Exclude the ignored local operator changelog from source snapshots.
 # v1.10 - Show periodic vcpkg package/configuration step progress while CMake configure is otherwise silent.
 # v1.09 - Cap every native build stage at four concurrent jobs to prevent CPU and power spikes.
@@ -53,8 +56,10 @@ Usage:
     python "1. build.py" --help
 
 The normal command never removes the build tree or runtime data. If the exact
-``build\\Release\\devhub.exe`` process is running, the script asks its window to
-close only when its command line proves it is the normal no-argument launch.
+``build\\Release\\devhub.exe`` process is running, the script asks its exact
+PID-owned ``XADevHubNative`` top-level window to close, including when Windows
+reports that window hidden, only after its command line proves it is the normal
+no-argument launch.
 Custom data directories, ports, headless modes, or unreadable command lines are
 refused before the process is touched. The app restarts only after the new
 executable passes validation. When a production database exists, a coherent
@@ -85,9 +90,13 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tools import release_receipt
 
 
 # BuildRunner invokes this wrapper with anonymous pipes, where Python otherwise
@@ -109,9 +118,9 @@ CMAKE_FILE = PROJECT_DIR / "CMakeLists.txt"
 BACKUP_ROOT = PROJECT_DIR / "backups"
 DATABASE_PATH = RELEASE_DIR / "data" / "devhub.db"
 DATABASE_BACKUP_ROOT = RELEASE_DIR / "data" / "backups"
-API_TOKEN_PATH = RELEASE_DIR / "data" / "api-token"
 CMAKE_GENERATOR = "Visual Studio 17 2022"
 HEALTH_URL = "http://127.0.0.1:21100/api/health"
+API_RENDEZVOUS_SCHEMA = "xa-devhub.api-rendezvous/v1"
 HEALTH_STARTUP_TIMEOUT_SECONDS = 20.0
 HEALTH_STABILITY_SECONDS = 3.0
 BUILD_CONCURRENCY_LIMIT = 4
@@ -125,6 +134,8 @@ VCPKG_PROGRESS_MIN_PRINT_SECONDS = 5.0
 VCPKG_PROGRESS_HEARTBEAT_SECONDS = 10.0
 VCPKG_PROGRESS_TAIL_BYTES = 256 * 1024
 APPCOMPAT_LAYERS_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+DEVHUB_WINDOW_CLASS = "XADevHubNative"
+WM_CLOSE = 0x0010
 
 BACKUP_EXCLUDE_PARTS = {
     ".git",
@@ -151,6 +162,80 @@ BACKUP_EXCLUDE_SUFFIXES = {
 
 class BuildFailure(RuntimeError):
     """Expected build failure with a concise operator-facing message."""
+
+
+def canonical_loopback_origin(base_url: str) -> str:
+    """Normalize every supported loopback alias to one exact HTTP origin."""
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise BuildFailure("The DevHub health URL has an invalid port.") from exc
+    if (
+        parsed.scheme.lower() != "http"
+        or (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/", "/api/health"}
+    ):
+        raise BuildFailure("The DevHub health URL must be an HTTP loopback URL.")
+    if port is None:
+        port = 80
+    return f"http://127.0.0.1:{port}"
+
+
+def api_rendezvous_path(base_url: str) -> Path:
+    """Return the non-roaming per-user rendezvous for the selected instance."""
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        raise BuildFailure("LOCALAPPDATA is unavailable for DevHub API discovery.")
+    origin = canonical_loopback_origin(base_url)
+    port = urllib.parse.urlsplit(origin).port
+    if port is None:
+        raise BuildFailure("The canonical DevHub origin has no effective port.")
+    return (
+        Path(local_app_data)
+        / "XA DevHub"
+        / "api"
+        / f"api-token-v1-{port}.json"
+    )
+
+
+def read_api_rendezvous(
+    base_url: str, *, expected_pid: int | None = None
+) -> tuple[str, str]:
+    """Read and validate the selected rendezvous without returning secret details."""
+    try:
+        path = api_rendezvous_path(base_url)
+        origin = canonical_loopback_origin(base_url)
+    except BuildFailure as exc:
+        return "", str(exc)
+    if not path.is_file():
+        return "", f"API rendezvous is not available for {origin}"
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > 4096:
+            return "", "API rendezvous size is invalid"
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "", "API rendezvous could not be read as valid UTF-8 JSON"
+    if not isinstance(record, dict):
+        return "", "API rendezvous is not a JSON object"
+    if record.get("schema") != API_RENDEZVOUS_SCHEMA:
+        return "", "API rendezvous schema is unsupported"
+    if record.get("origin") != origin:
+        return "", "API rendezvous does not match the selected loopback instance"
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "", "API rendezvous process identity is invalid"
+    if expected_pid is not None and pid != expected_pid:
+        return "", f"API rendezvous does not belong to expected PID {expected_pid}"
+    token = record.get("token")
+    if not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        return "", "API rendezvous token shape is invalid"
+    return token, ""
 
 
 def format_process_launch_error(
@@ -951,6 +1036,92 @@ def require_default_devhub_launch(
     print("  [OK] Exact production command line is the default no-argument launch.")
 
 
+def devhub_window_handles_for_pid(pid: int) -> list[int]:
+    """Enumerate exact-class top-level windows for one already-verified PID.
+
+    EnumWindows intentionally includes hidden windows. The executable and
+    command-line checks happen before this function is called.
+    """
+    if os.name != "nt":
+        raise BuildFailure("Graceful DevHub window shutdown is available only on Windows.")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise BuildFailure("Graceful DevHub window shutdown received an invalid PID.")
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    enum_windows = user32.EnumWindows
+    enum_windows.argtypes = [enum_callback, ctypes.c_void_p]
+    enum_windows.restype = ctypes.c_bool
+    get_window_pid = user32.GetWindowThreadProcessId
+    get_window_pid.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    get_window_pid.restype = ctypes.c_ulong
+    get_class_name = user32.GetClassNameW
+    get_class_name.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    get_class_name.restype = ctypes.c_int
+
+    handles: list[int] = []
+    callback_error = 0
+
+    def inspect_window(window: int, _state: int) -> bool:
+        nonlocal callback_error
+        owner_pid = ctypes.c_ulong()
+        get_window_pid(window, ctypes.byref(owner_pid))
+        if owner_pid.value != pid:
+            return True
+
+        class_name = ctypes.create_unicode_buffer(256)
+        ctypes.set_last_error(0)
+        if get_class_name(window, class_name, len(class_name)) <= 0:
+            callback_error = ctypes.get_last_error() or 1
+            return False
+        if class_name.value == DEVHUB_WINDOW_CLASS:
+            handles.append(int(window))
+        return True
+
+    callback = enum_callback(inspect_window)
+    ctypes.set_last_error(0)
+    if not enum_windows(callback, None):
+        error = callback_error or ctypes.get_last_error() or 1
+        raise BuildFailure(
+            f"Could not enumerate top-level windows for exact DevHub PID {pid} "
+            f"(Win32 error {error}). No close message was sent."
+        )
+    return sorted(set(handles))
+
+
+def post_devhub_window_close(window_handle: int) -> int:
+    """Queue WM_CLOSE and return zero, or the Win32 error without terminating."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    post_message = user32.PostMessageW
+    post_message.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+    ]
+    post_message.restype = ctypes.c_bool
+    ctypes.set_last_error(0)
+    if post_message(window_handle, WM_CLOSE, 0, 0):
+        return 0
+    return ctypes.get_last_error() or 1
+
+
+def request_graceful_devhub_close(pid: int) -> None:
+    handles = devhub_window_handles_for_pid(pid)
+    if len(handles) != 1:
+        raise BuildFailure(
+            f"Exact DevHub PID {pid} exposed {len(handles)} matching "
+            f"{DEVHUB_WINDOW_CLASS} top-level windows; exactly one is required. "
+            "No close message was sent."
+        )
+    error = post_devhub_window_close(handles[0])
+    if error:
+        raise BuildFailure(
+            f"Windows rejected WM_CLOSE for exact DevHub PID {pid} "
+            f"(Win32 error {error}). No force-kill was attempted."
+        )
+
+
 def close_running_devhub(pids: list[int]) -> None:
     if not pids:
         print("  [OK] Production DevHub is not running.")
@@ -958,35 +1129,13 @@ def close_running_devhub(pids: list[int]) -> None:
 
     for pid in pids:
         print(f"  [STOP] Requesting graceful close for exact production PID {pid}...")
-        environment = os.environ.copy()
-        environment["DEVHUB_BUILD_PID"] = str(pid)
-        script = r"""
-$process = Get-Process -Id ([int]$env:DEVHUB_BUILD_PID) -ErrorAction SilentlyContinue
-if ($null -eq $process) { exit 0 }
-if (-not $process.CloseMainWindow()) { exit 2 }
-"""
-        result = subprocess.run(
-            [
-                powershell_executable(),
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                script,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=environment,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise BuildFailure(
-                f"PID {pid} did not accept a graceful window close. Stop that exact process "
-                "manually and rerun; no force-kill was attempted."
-            )
+        try:
+            request_graceful_devhub_close(pid)
+        except BuildFailure:
+            if pid not in matching_devhub_pids():
+                print(f"  [OK] Exact production PID {pid} exited before WM_CLOSE was queued.")
+                continue
+            raise
 
     deadline = time.monotonic() + 15.0
     remaining = set(pids)
@@ -1100,19 +1249,16 @@ def verify_output(expected_version: str) -> tuple[str, str]:
     return file_version, product_version
 
 
-def fetch_runtime_health(expected_version: str) -> tuple[bool, str]:
+def fetch_runtime_health(
+    expected_version: str, expected_pid: int | None = None
+) -> tuple[bool, str]:
     headers = {"Accept": "application/json", "Connection": "close"}
-    if API_TOKEN_PATH.exists():
-        try:
-            token = API_TOKEN_PATH.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeError) as exc:
-            return False, f"could not read the runtime API token: {exc}"
-        if re.fullmatch(r"[0-9a-f]{64}", token) is None:
-            return False, "runtime api-token is not 64 lowercase hexadecimal characters"
-        headers["X-DevHub-Token"] = token
-    # No file is a compatibility path for pre-auth binaries only. An auth-aware
-    # binary creates the file before binding, so its health check will return
-    # 401 until the fresh token becomes available and the retry loop rereads it.
+    token, token_error = read_api_rendezvous(
+        HEALTH_URL, expected_pid=expected_pid
+    )
+    if token_error:
+        return False, token_error
+    headers["X-DevHub-Token"] = token
     request = urllib.request.Request(
         HEALTH_URL,
         headers=headers,
@@ -1165,7 +1311,9 @@ def wait_for_runtime_health(
             stable_since = None
             last_detail = f"PID {process.pid} was not confirmed as the exact production executable"
         else:
-            healthy, detail = fetch_runtime_health(expected_version)
+            healthy, detail = fetch_runtime_health(
+                expected_version, expected_pid=process.pid
+            )
             last_detail = detail
             now = time.monotonic()
             if healthy:
@@ -1243,6 +1391,9 @@ def main() -> int:
         version = read_app_version()
         build_concurrency = enforce_build_concurrency_limit()
         toolchain = preflight()
+        receipt_path = release_receipt.regular_path(RELEASE_DIR / release_receipt.RECEIPT_NAME)
+        receipt_path.unlink(missing_ok=True)
+        receipt_inputs = release_receipt.build_inputs(PROJECT_DIR)
 
         banner(f"XA DevHub - Build v{version}")
         print(f"  Project:   {PROJECT_DIR}")
@@ -1308,6 +1459,11 @@ def main() -> int:
         else:
             print("  [OK] DevHub was not running before the build; it remains stopped.")
 
+        if not args.no_tests:
+            release_receipt.write_receipt(PROJECT_DIR, RELEASE_DIR, version, receipt_inputs)
+            print("  [OK] Verified build receipt saved for step 2 packaging.")
+        else:
+            print("  [SKIP] No release receipt: packaging requires a build with tests enabled.")
         banner("BUILD SUCCESSFUL")
         print(f"  Output:  {EXE_PATH}")
         print(f"  Version: v{version}")

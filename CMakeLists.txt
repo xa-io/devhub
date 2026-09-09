@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xa_devhub VERSION 1.0.5 LANGUAGES CXX)
+project(xa_devhub VERSION 1.0.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,6 +61,7 @@ add_library(devhub_app STATIC
     src/app/DataMaintenance.cpp
     src/app/Db.cpp
     src/app/DiscordBot.cpp
+    src/app/DiscordIntakeOps.cpp
     src/app/DiscordSettingsOps.cpp
     src/app/Gui.cpp
     src/app/GuiBranding.cpp
@@ -70,6 +71,7 @@ add_library(devhub_app STATIC
     src/app/KnowledgeOps.cpp
     src/app/Ops.cpp
     src/app/OpsCalendar.cpp
+    src/app/OpsDiscordTickets.cpp
     src/app/OpsItems.cpp
     src/app/PacketData.cpp
     src/app/PacketExports.cpp
@@ -90,6 +92,7 @@ target_link_libraries(devhub_app PUBLIC
     d3d11 dxgi dwmapi
     ws2_32
     shlwapi
+    shell32
     winhttp
     bcrypt advapi32 crypt32
     ole32 oleaut32
@@ -172,6 +175,7 @@ if(POWERSHELL_EXE)
         tests/octo_p1_contract.ps1
         tests/octo_p2_contract.ps1
         tests/review_reaction_cleanup_contract.ps1
+        tests/ticket_merge_contract.ps1
         tests/ticket_menu_filter_contract.ps1
         tests/ticket_import_contract.ps1
     )

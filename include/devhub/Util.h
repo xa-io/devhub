@@ -35,6 +35,9 @@ std::string makeTitle(const std::string& body, size_t maxLen = 120);
 
 // Current UTC time as "YYYY-MM-DDTHH:MM:SSZ" and local date as "YYYY-MM-DD".
 std::string nowIsoUtc();
+// Returns a valid UTC second strictly later than `floor`, even when two
+// optimistic-concurrency mutations occur during the same wall-clock second.
+std::string nextIsoUtcAfter(const std::string& floor);
 std::string todayLocal();
 int64_t nowEpochMs();
 

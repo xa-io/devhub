@@ -1274,38 +1274,40 @@ SELECT COUNT(*) FROM projects WHERE
                     addProject("Archived Project", true, true);
 
                 const long long zeroCompleted = insertItemLocked(lk.token(),
-                    &fixture, zeroProject, "fix", "Completed only", "", 2, 0,
+                    &fixture, zeroProject, "fix", "Xagman completed only", "", 2, 0,
                     "test", "", "");
                 setItemStatusLocked(lk.token(), &fixture, zeroCompleted, "completed");
-                insertItemLocked(lk.token(), &fixture, zeroProject, "note", "Open note", "",
+                insertItemLocked(lk.token(), &fixture, zeroProject, "note", "Xagman open note", "",
                                  2, 0, "test", "", "");
 
-                insertItemLocked(lk.token(), &fixture, activeProject, "fix", "Open fix", "",
+                insertItemLocked(lk.token(), &fixture, activeProject, "fix", "Open fix",
+                                 "Uses the xagman route for recovery",
                                  2, 0, "test", "", "");
                 const long long activeProgress = insertItemLocked(lk.token(),
                     &fixture, activeProject, "implementation",
-                    "Implementation in progress", "", 2, 0, "test", "", "");
+                    "Xagman implementation in progress", "", 2, 0, "test", "", "");
                 setItemStatusLocked(lk.token(), &fixture, activeProgress, "in_progress");
                 const long long activeBlocked = insertItemLocked(lk.token(),
-                    &fixture, activeProject, "fix", "Blocked fix", "", 2, 0,
+                    &fixture, activeProject, "fix", "Blocked fix",
+                    "Waiting on XAGMAN handoff", 2, 0,
                     "test", "", "");
                 setItemStatusLocked(lk.token(), &fixture, activeBlocked, "blocked");
                 const long long activeCompleted = insertItemLocked(lk.token(),
                     &fixture, activeProject, "implementation",
-                    "Completed implementation", "", 2, 0, "test", "", "");
+                    "Xagman completed implementation", "", 2, 0, "test", "", "");
                 setItemStatusLocked(lk.token(), &fixture, activeCompleted, "completed");
                 const long long activeWontDo = insertItemLocked(lk.token(),
-                    &fixture, activeProject, "fix", "Won't-do fix", "", 2, 0,
+                    &fixture, activeProject, "fix", "Xagman won't-do fix", "", 2, 0,
                     "test", "", "");
                 setItemStatusLocked(lk.token(), &fixture, activeWontDo, "wont_do");
                 insertItemLocked(lk.token(), &fixture, activeProject, "note",
-                                 "Open non-ticket note", "", 2, 0, "test", "",
+                                 "Xagman open non-ticket note", "", 2, 0, "test", "",
                                  "");
 
                 insertItemLocked(lk.token(), &fixture, optedOutProject, "fix",
-                                 "Opted-out open fix", "", 2, 0, "test", "", "");
+                                 "Xagman opted-out open fix", "", 2, 0, "test", "", "");
                 insertItemLocked(lk.token(), &fixture, archivedProject, "implementation",
-                                 "Archived open implementation", "", 2, 0,
+                                 "Xagman archived open implementation", "", 2, 0,
                                  "test", "", "");
             }
 
@@ -1329,6 +1331,58 @@ SELECT COUNT(*) FROM projects WHERE
                       implementationCount == 1 &&
                       static_cast<int>(detail.size()) == menu[0].openCount,
                   "ticket menu count matches the active fix/implementation detail projection");
+
+            const TicketSearchResult search =
+                searchActiveTicketTitles(&fixture, "xAgMaN", 500);
+            const auto hasSearchTitle = [&](const std::string& title) {
+                return std::any_of(
+                    search.entries.begin(), search.entries.end(),
+                    [&](const TicketSearchEntry& entry) {
+                        return entry.projectName == "Active Ticket Project" &&
+                               entry.title == title;
+                    });
+            };
+            check(search.totalMatches == 3 && search.entries.size() == 3 &&
+                      hasSearchTitle("Open fix") &&
+                      hasSearchTitle("Xagman implementation in progress") &&
+                      hasSearchTitle("Blocked fix"),
+                  "ticket search matches title or body case-insensitively while excluding terminal, note, archived, and opted-out work");
+
+            const TicketSearchResult limited =
+                searchActiveTicketTitles(&fixture, "xagman", 2);
+            check(limited.totalMatches == 3 && limited.entries.size() == 2,
+                  "ticket search reports the full match count while bounding projected results");
+            check(searchActiveTicketTitles(&fixture, "   ", 500)
+                      .entries.empty(),
+                  "ticket search rejects an empty normalized query");
+
+            const std::string asciiPreview = ticketSearchTitlePreview(
+                std::string(60, 'a'), 50);
+            const std::string unicodePreview = ticketSearchTitlePreview(
+                "\xC3\xA9\xC3\xA9\xC3\xA9", 2);
+            check(asciiPreview == std::string(49, 'a') +
+                      "\xE2\x80\xA6" &&
+                      unicodePreview == "\xC3\xA9\xE2\x80\xA6" &&
+                      ticketSearchTitlePreview("line one\nline two", 50) ==
+                          "line one line two",
+                  "ticket search title previews are 50-character bounded, UTF-8 safe, and single-line");
+
+            std::vector<TicketSearchEntry> pageEntries;
+            for (int i = 0; i < 21; ++i) {
+                TicketSearchEntry entry;
+                entry.itemId = 100 + i;
+                entry.projectName = "Active Ticket Project";
+                entry.title = std::string(55, 't') + std::to_string(i);
+                pageEntries.push_back(std::move(entry));
+            }
+            const std::vector<std::string> pages =
+                ticketSearchPages(pageEntries, 20, 50);
+            check(pages.size() == 2 &&
+                      std::count(pages[0].begin(), pages[0].end(), '\n') == 20 &&
+                      pages[1].find("I120 | Active Ticket Project | ") == 0 &&
+                      pages[0].find(std::string(49, 't') +
+                                    "\xE2\x80\xA6") != std::string::npos,
+                  "ticket search pages contain only bounded identity, project, and title rows at twenty results per page");
         }
 
     });
@@ -1434,19 +1488,89 @@ SELECT COUNT(*) FROM projects WHERE
             check(mergedImmutable,
                   "merged audit record rejects every public status transition");
 
+            const long long carolId = ensureSourceLocked(
+                lk.token(), &db, "Carol", "test", "");
+            const long long batchMergeTarget = insertItemLocked(
+                lk.token(), &db, projectId, "implementation",
+                "Batch merge target", "Primary batch note", 3,
+                aliceId, "test", "", "");
+            const long long batchMergeFirst = insertItemLocked(
+                lk.token(), &db, projectId, "implementation",
+                "Batch duplicate one", "First extra note", 2,
+                bobId, "test", "", "");
+            const long long batchMergeSecond = insertItemLocked(
+                lk.token(), &db, projectId, "fix",
+                "Batch duplicate two", "Second extra note", 2,
+                carolId, "test", "", "");
+            setItemStatusLocked(lk.token(), &db, batchMergeSecond, "completed");
+            std::string batchMergeError;
+            check(mergeItemsLocked(
+                      lk.token(), &db,
+                      std::vector<long long>{batchMergeFirst, batchMergeSecond},
+                      batchMergeTarget, batchMergeError),
+                  "multiple tickets including a terminal source merge in one batch");
+            SQLite::Statement batchTarget(db.raw(lk.token()),
+                "SELECT body,(SELECT COUNT(*) FROM item_sources WHERE item_id=?),"
+                "(SELECT COUNT(*) FROM item_merges WHERE target_item_id=?) "
+                "FROM items WHERE id=?");
+            batchTarget.bind(1, batchMergeTarget);
+            batchTarget.bind(2, batchMergeTarget);
+            batchTarget.bind(3, batchMergeTarget);
+            requireRow(batchTarget, "batch merge target query returned a row");
+            const std::string batchBody = batchTarget.getColumn(0).getString();
+            const std::size_t firstBatchNote = batchBody.find("First extra note");
+            const std::size_t secondBatchNote = batchBody.find("Second extra note");
+            SQLite::Statement batchSources(db.raw(lk.token()),
+                "SELECT COUNT(*) FROM items WHERE id IN (?,?) AND status='merged'");
+            batchSources.bind(1, batchMergeFirst);
+            batchSources.bind(2, batchMergeSecond);
+            requireRow(batchSources, "batch merge source query returned a row");
+            SQLite::Statement batchCompletionEvents(db.raw(lk.token()),
+                "SELECT COUNT(*) FROM events WHERE item_id=? AND kind='completion'");
+            batchCompletionEvents.bind(1, batchMergeSecond);
+            requireRow(batchCompletionEvents,
+                       "terminal batch source event query returned a row");
+            check(batchBody.find("Primary batch note") != std::string::npos &&
+                      firstBatchNote != std::string::npos &&
+                      secondBatchNote != std::string::npos &&
+                      firstBatchNote < secondBatchNote &&
+                      batchTarget.getColumn(1).getInt64() == 3 &&
+                      batchTarget.getColumn(2).getInt64() == 2 &&
+                      batchSources.getColumn(0).getInt64() == 2 &&
+                      batchCompletionEvents.getColumn(0).getInt64() == 0,
+                  "batch merge appends every note and preserves contributors, audit rows, and terminal cleanup");
+            SQLite::Statement cleanBatchMerge(db.raw(lk.token()),
+                "DELETE FROM items WHERE id IN (?,?,?)");
+            cleanBatchMerge.bind(1, batchMergeFirst);
+            cleanBatchMerge.bind(2, batchMergeSecond);
+            cleanBatchMerge.bind(3, batchMergeTarget);
+            cleanBatchMerge.exec();
+
             const long long imageMergeTarget = insertItemLocked(lk.token(),
                 &db, projectId, "implementation", "Image merge target", "", 2,
                 aliceId, "test", "", "");
             const long long imageMergeSource = insertItemLocked(lk.token(),
                 &db, projectId, "implementation", "Image merge source", "", 2,
                 bobId, "test", "", "");
+            const long long imageMergeExtraSource = insertItemLocked(
+                lk.token(), &db, projectId, "implementation",
+                "Image merge extra source", "", 2,
+                carolId, "test", "", "");
+            std::string imageMergeError;
+            check(!mergeItemsLocked(
+                      lk.token(), &db,
+                      std::vector<long long>{imageMergeSource, imageMergeSource},
+                      imageMergeTarget, imageMergeError) &&
+                      imageMergeError.find("distinct") != std::string::npos,
+                  "batch merge rejects duplicate source identities before mutation");
             for (int i = 0; i < 12; ++i) {
                 SQLite::Statement image(db.raw(lk.token()),
                     "INSERT INTO ticket_attachments(item_id,source_channel_id,"
                     "source_message_id,attachment_id,source_role,declared_size,"
                     "state,created_at,updated_at) VALUES(?,?,?,?,?,?,"
                     "'queued',?,?)");
-                image.bind(1, i < 6 ? imageMergeTarget : imageMergeSource);
+                image.bind(1, i < 4 ? imageMergeTarget :
+                              (i < 8 ? imageMergeSource : imageMergeExtraSource));
                 image.bind(2, "223456789012345678");
                 image.bind(3, "223456789012345" + std::to_string(700 + i));
                 image.bind(4, "323456789012345" + std::to_string(700 + i));
@@ -1456,35 +1580,58 @@ SELECT COUNT(*) FROM projects WHERE
                 image.bind(7, now); image.bind(8, now);
                 image.exec();
             }
-            std::string imageMergeError;
-            check(!mergeItemsLocked(lk.token(), &db, imageMergeSource, imageMergeTarget,
-                                    imageMergeError) &&
+            imageMergeError.clear();
+            check(!mergeItemsLocked(
+                      lk.token(), &db,
+                      std::vector<long long>{imageMergeSource,
+                                             imageMergeExtraSource},
+                      imageMergeTarget, imageMergeError) &&
                       imageMergeError.find("queued ticket attachments") !=
                           std::string::npos,
-                  "merge waits for asynchronous image persistence to settle");
+                  "batch merge waits for every asynchronous image to settle");
             SQLite::Statement settleImageMerge(db.raw(lk.token()),
                 "UPDATE ticket_attachments SET state='saved',"
                 "relative_path='ticket-images\\I'||item_id||'\\'||"
                 "source_message_id||'-'||attachment_id||'.png',"
                 "actual_size=1,sha256=?,saved_at=?,updated_at=? "
-                "WHERE item_id IN (?,?) AND state='queued'");
+                "WHERE item_id IN (?,?,?) AND state='queued'");
             settleImageMerge.bind(1, std::string(64, 'a'));
             const std::string settledAt = nowIsoUtc();
             settleImageMerge.bind(2, settledAt);
             settleImageMerge.bind(3, settledAt);
             settleImageMerge.bind(4, imageMergeSource);
             settleImageMerge.bind(5, imageMergeTarget);
+            settleImageMerge.bind(6, imageMergeExtraSource);
             settleImageMerge.exec();
             imageMergeError.clear();
-            check(!mergeItemsLocked(lk.token(), &db, imageMergeSource, imageMergeTarget,
-                                    imageMergeError) &&
+            check(!mergeItemsLocked(
+                      lk.token(), &db,
+                      std::vector<long long>{imageMergeSource,
+                                             imageMergeExtraSource},
+                      imageMergeTarget, imageMergeError) &&
                       imageMergeError.find("10-attachment") !=
                           std::string::npos,
-                  "merge refuses combined live attachment evidence above ticket caps");
+                  "batch merge refuses combined live attachment evidence above ticket caps");
+            SQLite::Statement atomicBatchFailure(db.raw(lk.token()),
+                "SELECT (SELECT COUNT(*) FROM items WHERE id IN (?,?) AND status='open'),"
+                "(SELECT COUNT(*) FROM item_merges WHERE source_item_id IN (?,?)),"
+                "(SELECT body FROM items WHERE id=?)");
+            atomicBatchFailure.bind(1, imageMergeSource);
+            atomicBatchFailure.bind(2, imageMergeExtraSource);
+            atomicBatchFailure.bind(3, imageMergeSource);
+            atomicBatchFailure.bind(4, imageMergeExtraSource);
+            atomicBatchFailure.bind(5, imageMergeTarget);
+            requireRow(atomicBatchFailure,
+                       "failed batch merge atomicity query returned a row");
+            check(atomicBatchFailure.getColumn(0).getInt64() == 2 &&
+                      atomicBatchFailure.getColumn(1).getInt64() == 0 &&
+                      atomicBatchFailure.getColumn(2).getString().empty(),
+                  "failed batch merge leaves every source and target unchanged");
             SQLite::Statement cleanImageMerge(db.raw(lk.token()),
-                "DELETE FROM items WHERE id IN (?,?)");
+                "DELETE FROM items WHERE id IN (?,?,?)");
             cleanImageMerge.bind(1, imageMergeSource);
             cleanImageMerge.bind(2, imageMergeTarget);
+            cleanImageMerge.bind(3, imageMergeExtraSource);
             cleanImageMerge.exec();
 
             setItemStatusLocked(lk.token(), &db, keptId, "completed");
@@ -1582,12 +1729,13 @@ SELECT COUNT(*) FROM projects WHERE
         const std::string boundedCompactLeaderboard =
             compactLeaderboardDescription(boundedRenderRows);
         check(exactCompactLeaderboard ==
-                  "**Alice** \xE2\x80\x94 4/10 Implemented\n"
-                  "**Bob** \xE2\x80\x94 3/5 Implemented\n" &&
+                  "Alice \xE2\x80\x94 4/10 Implemented\n"
+                  "Bob \xE2\x80\x94 3/5 Implemented\n" &&
               std::count(boundedCompactLeaderboard.begin(),
                          boundedCompactLeaderboard.end(), '\n') == 10 &&
-              boundedCompactLeaderboard.find("User10") == std::string::npos,
-              "compact leaderboard renders exact safe text and enforces its ten-row bound");
+              boundedCompactLeaderboard.find("User10") == std::string::npos &&
+              exactCompactLeaderboard.find('*') == std::string::npos,
+              "compact leaderboard renders exact plain text and enforces its ten-row bound");
         const bool excludedBob = setLeaderboardSourceExcluded(
             &db, bobId, true, &leaderboardError);
         const std::vector<LeaderboardEntry> publicLeaderboard =
@@ -2634,8 +2782,12 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
                 Server importServer(&importDestination, &importBuilds, importPort,
                                     importDestinationRoot.string());
                 const uint16_t started = importServer.start();
-                const std::string token = trim(readFileUtf8(
-                    (importDestinationRoot / "api-token").string()));
+                const std::string importRendezvousPath = apiRendezvousPath(
+                    importPort, importDestinationRoot.string());
+                const nlohmann::json importRendezvous = nlohmann::json::parse(
+                    readFileUtf8(importRendezvousPath), nullptr, false);
+                const std::string token = importRendezvous.is_object()
+                    ? importRendezvous.value("token", "") : std::string();
                 const SelftestHttpResponse response = selftestPostJson(
                     started, "/api/work/import", approvedImport.dump(), token);
                 const nlohmann::json responseBody = nlohmann::json::parse(
@@ -2650,6 +2802,8 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
                               .value("attachments", 0) == 1,
                       "authenticated work import route returns exact replay manifest");
                 importServer.stop();
+                check(!std::filesystem::exists(importRendezvousPath),
+                      "historical import server removes only its owned rendezvous on stop");
             }
         });
 
@@ -2661,15 +2815,30 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
         if (p0Port != 0) {
             Server p0Server(&db, &p0Builds, p0Port, testDir.string());
             const uint16_t startedPort = p0Server.start();
-            const std::string apiToken = trim(readFileUtf8(
-                (testDir / "api-token").string()));
+            const std::string p0RendezvousPath = apiRendezvousPath(
+                p0Port, testDir.string());
+            const std::string p0RendezvousText = readFileUtf8(p0RendezvousPath);
+            const nlohmann::json p0Rendezvous = nlohmann::json::parse(
+                p0RendezvousText, nullptr, false);
+            const std::string apiToken = p0Rendezvous.is_object()
+                ? p0Rendezvous.value("token", "") : std::string();
             const bool validApiToken = apiToken.size() == 64 &&
                 std::all_of(apiToken.begin(), apiToken.end(), [](char ch) {
                     return (ch >= '0' && ch <= '9') ||
                            (ch >= 'a' && ch <= 'f');
                 });
-            check(validApiToken,
-                  "disposable API token is 32 random bytes encoded as hex");
+            check(validApiToken && p0Rendezvous.is_object() &&
+                      p0Rendezvous.value("schema", "") ==
+                          "xa-devhub.api-rendezvous/v1" &&
+                      p0Rendezvous.value("origin", "") ==
+                          "http://127.0.0.1:" + std::to_string(p0Port) &&
+                      p0Rendezvous.value("pid", 0ULL) ==
+                          static_cast<unsigned long long>(GetCurrentProcessId()),
+                  "disposable API publishes a verified exact-instance rendezvous");
+            Server collidingServer(&db, &p0Builds, p0Port, testDir.string());
+            check(collidingServer.start() == 0 &&
+                      readFileUtf8(p0RendezvousPath) == p0RendezvousText,
+                  "a port collision cannot rotate the active instance rendezvous");
             const SelftestHttpResponse noTokenResponse = selftestPostJson(
                 startedPort, "/api/settings", "{}");
             const SelftestHttpResponse wrongTokenResponse = selftestPostJson(
@@ -2748,6 +2917,205 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
                           "updated fixture" &&
                       projectUpdatedReadBody.value("discord_tickets", 0LL) == 1,
                   "project update is full-field atomic and rejects partial overwrite");
+
+            nlohmann::json apiWorkPayload = {
+                {"project_id", apiProjectId},
+                {"type", "fix"},
+                {"title", "API work create fixture"},
+                {"body", "Reproduce the transition and preserve fail-closed handling."},
+                {"priority", 4},
+                {"due_date", ""},
+                {"review_date", "2026-09-01"},
+                {"tags", "api,reliability"}
+            };
+            const SelftestHttpResponse workCreateResponse = selftestPostJson(
+                startedPort, "/api/work", apiWorkPayload.dump(), apiToken);
+            const nlohmann::json workCreateBody = nlohmann::json::parse(
+                workCreateResponse.body, nullptr, false);
+            const long long apiWorkId = workCreateBody.is_object()
+                ? workCreateBody.value("id", 0LL) : 0;
+            const SelftestHttpResponse workReadResponse = selftestGetJson(
+                startedPort, "/api/work/" + std::to_string(apiWorkId), apiToken);
+            const nlohmann::json workReadBody = nlohmann::json::parse(
+                workReadResponse.body, nullptr, false);
+            const SelftestHttpResponse workReplayResponse = selftestPostJson(
+                startedPort, "/api/work", apiWorkPayload.dump(), apiToken);
+            const nlohmann::json workReplayBody = nlohmann::json::parse(
+                workReplayResponse.body, nullptr, false);
+            apiWorkPayload["body"] = "Conflicting body";
+            const SelftestHttpResponse workConflictResponse = selftestPostJson(
+                startedPort, "/api/work", apiWorkPayload.dump(), apiToken);
+            const nlohmann::json workConflictBody = nlohmann::json::parse(
+                workConflictResponse.body, nullptr, false);
+            const SelftestHttpResponse invalidWorkResponse = selftestPostJson(
+                startedPort, "/api/work",
+                R"json({"project_id":1,"title":"partial"})json", apiToken);
+            check(workCreateResponse.status == 201 && apiWorkId > 0 &&
+                      workCreateBody.value("created", false) &&
+                      !workCreateBody.value("duplicate", true) &&
+                      workReadResponse.status == 200 &&
+                      workReadBody.value("id", 0LL) == apiWorkId &&
+                      workReadBody.value("project_id", 0LL) == apiProjectId &&
+                      workReadBody.value("type", std::string()) == "fix" &&
+                      workReadBody.value("status", std::string()) == "open" &&
+                      workReadBody.value("priority", 0LL) == 4 &&
+                      workReadBody.value("review_date", std::string()) ==
+                          "2026-09-01" &&
+                      workReadBody.value("origin", std::string()) == "api" &&
+                      workReplayResponse.status == 200 &&
+                      workReplayBody.value("id", 0LL) == apiWorkId &&
+                      !workReplayBody.value("created", true) &&
+                      workReplayBody.value("duplicate", false) &&
+                      workConflictResponse.status == 409 &&
+                      workConflictBody.value("existing_id", 0LL) == apiWorkId &&
+                      invalidWorkResponse.status == 400,
+                  "authenticated work create is strict idempotent and exactly readable");
+
+            const nlohmann::json titlePayload = {
+                {"title", "API title-only fixture"},
+                {"expected_updated_at",
+                 workReadBody.value("updated_at", std::string())}
+            };
+            const SelftestHttpResponse titleResponse = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(apiWorkId) + "/title",
+                titlePayload.dump(), apiToken);
+            const nlohmann::json titleBody = nlohmann::json::parse(
+                titleResponse.body, nullptr, false);
+            nlohmann::json staleTitlePayload = titlePayload;
+            staleTitlePayload["title"] = "Stale title must not save";
+            const SelftestHttpResponse staleTitleResponse = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(apiWorkId) + "/title",
+                staleTitlePayload.dump(), apiToken);
+            nlohmann::json extraTitlePayload = titlePayload;
+            extraTitlePayload["body"] = "must not be accepted";
+            const SelftestHttpResponse extraTitleResponse = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(apiWorkId) + "/title",
+                extraTitlePayload.dump(), apiToken);
+            check(titleResponse.status == 200 && titleBody.is_object() &&
+                      titleBody.value("title", std::string()) ==
+                          "API title-only fixture" &&
+                      titleBody.value("body", std::string()) ==
+                          workReadBody.value("body", std::string()) &&
+                      titleBody.value("status", std::string()) ==
+                          workReadBody.value("status", std::string()) &&
+                      titleBody.value("updated_at", std::string()) !=
+                          workReadBody.value("updated_at", std::string()) &&
+                      staleTitleResponse.status == 409 &&
+                      extraTitleResponse.status == 400,
+                  "title-only API preserves ticket data and rejects stale or expanded writes");
+
+            nlohmann::json firstMergeSourcePayload = {
+                {"project_id", apiProjectId},
+                {"type", "implementation"},
+                {"title", "First API merge source"},
+                {"body", "First API source note."},
+                {"priority", 2},
+                {"due_date", ""},
+                {"review_date", ""},
+                {"tags", "merge"}
+            };
+            nlohmann::json secondMergeSourcePayload = firstMergeSourcePayload;
+            secondMergeSourcePayload["title"] = "Second API merge source";
+            secondMergeSourcePayload["body"] = "Second API source note.";
+            const SelftestHttpResponse firstMergeCreate = selftestPostJson(
+                startedPort, "/api/work", firstMergeSourcePayload.dump(),
+                apiToken);
+            const SelftestHttpResponse secondMergeCreate = selftestPostJson(
+                startedPort, "/api/work", secondMergeSourcePayload.dump(),
+                apiToken);
+            const nlohmann::json firstMergeCreateBody = nlohmann::json::parse(
+                firstMergeCreate.body, nullptr, false);
+            const nlohmann::json secondMergeCreateBody = nlohmann::json::parse(
+                secondMergeCreate.body, nullptr, false);
+            const long long firstMergeId = firstMergeCreateBody.value("id", 0LL);
+            const long long secondMergeId = secondMergeCreateBody.value("id", 0LL);
+            const SelftestHttpResponse completeSecondMerge = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(secondMergeId) + "/status",
+                R"json({"status":"completed"})json", apiToken);
+            const SelftestHttpResponse firstMergeRead = selftestGetJson(
+                startedPort, "/api/work/" + std::to_string(firstMergeId),
+                apiToken);
+            const SelftestHttpResponse secondMergeRead = selftestGetJson(
+                startedPort, "/api/work/" + std::to_string(secondMergeId),
+                apiToken);
+            const nlohmann::json firstMergeBody = nlohmann::json::parse(
+                firstMergeRead.body, nullptr, false);
+            const nlohmann::json secondMergeBody = nlohmann::json::parse(
+                secondMergeRead.body, nullptr, false);
+            const nlohmann::json mergePayload = {
+                {"expected_updated_at",
+                 titleBody.value("updated_at", std::string())},
+                {"sources", nlohmann::json::array({
+                    nlohmann::json{
+                        {"id", firstMergeId},
+                        {"expected_updated_at",
+                         firstMergeBody.value("updated_at", std::string())}},
+                    nlohmann::json{
+                        {"id", secondMergeId},
+                        {"expected_updated_at",
+                         secondMergeBody.value("updated_at", std::string())}}
+                })}
+            };
+            nlohmann::json duplicateMergePayload = mergePayload;
+            duplicateMergePayload["sources"][1] =
+                duplicateMergePayload["sources"][0];
+            const SelftestHttpResponse duplicateMergeResponse = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(apiWorkId) + "/merge",
+                duplicateMergePayload.dump(), apiToken);
+            const SelftestHttpResponse mergeResponse = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(apiWorkId) + "/merge",
+                mergePayload.dump(), apiToken);
+            const nlohmann::json mergeBody = nlohmann::json::parse(
+                mergeResponse.body, nullptr, false);
+            const SelftestHttpResponse staleMergeResponse = selftestPostJson(
+                startedPort,
+                "/api/work/" + std::to_string(apiWorkId) + "/merge",
+                mergePayload.dump(), apiToken);
+            const nlohmann::json mergedTarget = mergeBody.is_object()
+                ? mergeBody.value("target", nlohmann::json::object())
+                : nlohmann::json::object();
+            const nlohmann::json mergedSources = mergeBody.is_object()
+                ? mergeBody.value("sources", nlohmann::json::array())
+                : nlohmann::json::array();
+            const std::string mergedApiBody = mergedTarget.value(
+                "body", std::string());
+            check(firstMergeCreate.status == 201 &&
+                      secondMergeCreate.status == 201 &&
+                      completeSecondMerge.status == 200 &&
+                      firstMergeRead.status == 200 &&
+                      secondMergeRead.status == 200 &&
+                      secondMergeBody.value("status", std::string()) ==
+                          "completed" &&
+                      duplicateMergeResponse.status == 400 &&
+                      mergeResponse.status == 200 && mergeBody.is_object() &&
+                      mergeBody.value("ok", false) &&
+                      mergedTarget.value("id", 0LL) == apiWorkId &&
+                      mergedTarget.value("title", std::string()) ==
+                          "API title-only fixture" &&
+                      mergedTarget.value("merged_source_count", 0LL) == 2 &&
+                      mergedApiBody.find("First API source note.") !=
+                          std::string::npos &&
+                      mergedApiBody.find("Second API source note.") !=
+                          std::string::npos &&
+                      mergedSources.size() == 2 &&
+                      mergedSources[0].value("status", std::string()) ==
+                          "merged" &&
+                      mergedSources[0].value("merged_into_id", 0LL) ==
+                          apiWorkId &&
+                      mergedSources[1].value("status", std::string()) ==
+                          "merged" &&
+                      mergedSources[1].value("merged_into_id", 0LL) ==
+                          apiWorkId &&
+                      mergedSources[1].value("completed_at", std::string())
+                          .empty() &&
+                      staleMergeResponse.status == 409,
+                  "authenticated batch merge preserves notes and audit identities with exact concurrency");
             if (apiProjectId > 0) {
                 auto lk = db.guard();
                 SQLite::Statement activityDelete(db.raw(lk.token()),
@@ -2910,6 +3278,8 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
             check(healthAfterChunked.status == 200,
                   "health remains responsive after an oversized chunked body");
             p0Server.stop();
+            check(!std::filesystem::exists(p0RendezvousPath),
+                  "API shutdown removes its owned rendezvous");
         }
 
         std::string failedBuildError;
@@ -3120,6 +3490,197 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
                   revokedFailure.terminal &&
                   revokedState == "failed" && revokedTargetRows == 0,
               "revoked pending manual command terminates before target capture");
+
+        try {
+        std::printf("selftest: Discord mapped direct intake and admin reply lineage\n");
+        const std::string intakePath =
+            (testDir / "discord-manual-intake.db").string();
+        Db intakeDb(intakePath);
+        long long intakeProjectId = 0;
+        {
+            auto lk = intakeDb.guard();
+            const std::string now = nowIsoUtc();
+            SQLite::Statement project(intakeDb.raw(lk.token()),
+                "INSERT INTO projects(name,slug,created_at,updated_at) "
+                "VALUES('Discord intake fixture','discord-intake-fixture',?,?)");
+            project.bind(1, now);
+            project.bind(2, now);
+            project.exec();
+            intakeProjectId = intakeDb.raw(lk.token()).getLastInsertRowid();
+        }
+
+        const std::string mappedChannel = "523456789012345670";
+        const std::string mappedDirectMessage = "523456789012345671";
+        const std::string intakeAdminId = "523456789012345672";
+        const std::string creditedUserId = "523456789012345673";
+        ManualCommandStageOutcome mappedDirect = stageManualCaptureCommand(
+            &intakeDb, mappedChannel, "mapped-project", "523456789012345674",
+            "intake guild", mappedDirectMessage, "Intake Admin", intakeAdminId,
+            "<@999999999999999999> <@523456789012345673> fix crash in mapped request",
+            "2026-08-22T12:00:00Z", mappedDirectMessage, "", {});
+        {
+            auto lk = intakeDb.guard();
+            SQLite::Statement map(intakeDb.raw(lk.token()),
+                "UPDATE discord_channels SET project_id=? WHERE channel_id=?");
+            map.bind(1, intakeProjectId);
+            map.bind(2, mappedChannel);
+            map.exec();
+        }
+        IngestOutcome mappedCapture = completeManualCaptureCommand(
+            &intakeDb, mappedDirect.command, "Credited User", creditedUserId,
+            "fix crash in mapped request", "2026-08-22T12:00:00Z", {});
+        MappedManualPromotionOutcome mappedPromotion =
+            promoteMappedManualCapture(
+                &intakeDb, nullptr, mappedCapture.messageRowId);
+        MappedManualPromotionOutcome mappedReplay =
+            promoteMappedManualCapture(
+                &intakeDb, nullptr, mappedCapture.messageRowId);
+        {
+            auto lk = intakeDb.guard();
+            SQLite::Statement mapped(intakeDb.raw(lk.token()), R"sql(
+SELECT m.state,m.author,m.author_id,COALESCE(m.item_id,0),i.project_id,
+       i.priority,s.name,s.handle,x.credited,i.credited,m.kind,i.type
+  FROM discord_messages m
+  JOIN items i ON i.id=m.item_id
+  JOIN sources s ON s.id=i.source_id
+  JOIN item_sources x ON x.item_id=i.id AND x.source_id=s.id
+ WHERE m.id=?
+)sql");
+            mapped.bind(1, mappedCapture.messageRowId);
+            requireRow(mapped,
+                       "mapped direct intake promotion returned a row");
+            check(mappedDirect.accepted && mappedCapture.ingested &&
+                      mappedPromotion.mapped && mappedPromotion.ok &&
+                      !mappedPromotion.duplicate &&
+                      mappedPromotion.itemId > 0 && mappedReplay.mapped &&
+                      mappedReplay.ok && mappedReplay.duplicate &&
+                      mappedReplay.itemId == mappedPromotion.itemId &&
+                      mapped.getColumn(0).getString() == "promoted" &&
+                      mapped.getColumn(1).getString() == "Credited User" &&
+                      mapped.getColumn(2).getString() == creditedUserId &&
+                      mapped.getColumn(3).getInt64() ==
+                          mappedPromotion.itemId &&
+                      mapped.getColumn(4).getInt64() == intakeProjectId &&
+                      mapped.getColumn(5).getInt() ==
+                          kDiscordReviewNormalPriority &&
+                      mapped.getColumn(6).getString() == "Credited User" &&
+                      mapped.getColumn(7).getString() == creditedUserId &&
+                       mapped.getColumn(8).getInt() == 1 &&
+                       mapped.getColumn(9).getInt() == 1 &&
+                       mapped.getColumn(10).getString() == "bug" &&
+                       mapped.getColumn(11).getString() == "fix",
+                  "mapped direct admin intake promotes once at normal priority as a fix, preserves classification, and credits the selected Discord contributor");
+        }
+
+        const std::string commonChannel = "523456789012345680";
+        const std::string commonDirectMessage = "523456789012345681";
+        ManualCommandStageOutcome commonDirect = stageManualCaptureCommand(
+            &intakeDb, commonChannel, "common", "523456789012345674",
+            "intake guild", commonDirectMessage, "Intake Admin", intakeAdminId,
+            "<@999999999999999999> common request",
+            "2026-08-22T12:01:00Z", commonDirectMessage, "", {});
+        IngestOutcome commonCapture = completeManualCaptureCommand(
+            &intakeDb, commonDirect.command, "Intake Admin", intakeAdminId,
+            "common request", "2026-08-22T12:01:00Z", {});
+        MappedManualPromotionOutcome commonPromotion =
+            promoteMappedManualCapture(
+                &intakeDb, nullptr, commonCapture.messageRowId);
+        {
+            auto lk = intakeDb.guard();
+            SQLite::Statement common(intakeDb.raw(lk.token()),
+                "SELECT state,COALESCE(item_id,0) FROM discord_messages WHERE id=?");
+            common.bind(1, commonCapture.messageRowId);
+            requireRow(common,
+                       "common-channel direct intake returned a row");
+            check(commonDirect.accepted && commonCapture.ingested &&
+                      !commonPromotion.mapped && commonPromotion.ok &&
+                      commonPromotion.itemId == 0 &&
+                      common.getColumn(0).getString() == "new" &&
+                      common.getColumn(1).getInt64() == 0,
+                  "common-channel direct admin intake stays pending for explicit project selection");
+        }
+
+        const std::string replyChannel = "523456789012345690";
+        const std::string sourceMessage = "523456789012345691";
+        IngestOutcome replySource = manualCaptureSuggestion(
+            &intakeDb, replyChannel, "mapped-project", "523456789012345674",
+            "intake guild", sourceMessage, "Original User",
+            "523456789012345692", "original request",
+            "2026-08-22T12:02:00Z", "", {});
+        nlohmann::json replySourcePromotion = promoteSuggestion(
+            &intakeDb, nullptr, replySource.messageRowId, intakeProjectId,
+            "", "");
+        const long long replyItemId =
+            replySourcePromotion.value("item_id", 0LL);
+        const std::string firstAdminPost = "523456789012345693";
+        const std::string secondAdminPost = "523456789012345694";
+        const std::string firstFollowup = "first admin follow-up";
+        const std::string secondFollowup = "second admin-post follow-up";
+        ManualCommandStageOutcome firstAdminCommand = stageManualCaptureCommand(
+            &intakeDb, replyChannel, "mapped-project", "523456789012345674",
+            "intake guild", firstAdminPost, "Intake Admin", intakeAdminId,
+            "<@999999999999999999> first follow-up",
+            "2026-08-22T12:03:00Z", sourceMessage, firstFollowup, {});
+        ManualCommandStageOutcome secondAdminCommand = stageManualCaptureCommand(
+            &intakeDb, replyChannel, "mapped-project", "523456789012345674",
+            "intake guild", secondAdminPost, "Intake Admin", intakeAdminId,
+            "<@999999999999999999> second follow-up",
+            "2026-08-22T12:04:00Z", firstAdminPost, secondFollowup, {});
+        IngestOutcome firstAppend = completeManualCaptureCommand(
+            &intakeDb, firstAdminCommand.command, "Original User",
+            "523456789012345692", "original request",
+            "2026-08-22T12:02:00Z", {});
+        ManualCaptureCommand resolvedSecondCommand;
+        const bool secondSelected = nextPendingManualCaptureCommand(
+            &intakeDb, resolvedSecondCommand);
+        IngestOutcome secondAppend = completeManualCaptureCommand(
+            &intakeDb, resolvedSecondCommand, "Original User",
+            "523456789012345692", "original request",
+            "2026-08-22T12:02:00Z", {});
+        {
+            auto lk = intakeDb.guard();
+            SQLite::Statement item(intakeDb.raw(lk.token()),
+                "SELECT body FROM items WHERE id=?");
+            item.bind(1, replyItemId);
+            requireRow(item, "admin-post follow-up item returned a row");
+            const std::string body = item.getColumn(0).getString();
+            const std::size_t firstAt = body.find(firstFollowup);
+            const std::size_t secondAt = body.find(secondFollowup);
+            SQLite::Statement result(intakeDb.raw(lk.token()),
+                "SELECT manual_target_message_id,manual_result_item_id "
+                "FROM discord_messages WHERE id=?");
+            result.bind(1, secondAdminCommand.command.commandRowId);
+            requireRow(result,
+                       "admin-post follow-up command returned a row");
+            check(replySource.ingested &&
+                      replySourcePromotion.value("ok", false) &&
+                      replyItemId > 0 && firstAdminCommand.accepted &&
+                      secondAdminCommand.accepted &&
+                      secondAdminCommand.command.targetMessageId ==
+                          firstAdminPost && firstAppend.appendedToItem &&
+                      firstAppend.itemId == replyItemId && secondSelected &&
+                      resolvedSecondCommand.commandRowId ==
+                          secondAdminCommand.command.commandRowId &&
+                      resolvedSecondCommand.targetMessageId == sourceMessage &&
+                      secondAppend.appendedToItem &&
+                      secondAppend.itemId == replyItemId &&
+                      result.getColumn(0).getString() == sourceMessage &&
+                      result.getColumn(1).getInt64() == replyItemId &&
+                      firstAt != std::string::npos &&
+                      body.find(firstFollowup,
+                                firstAt + firstFollowup.size()) ==
+                          std::string::npos &&
+                      secondAt != std::string::npos &&
+                      body.find(secondFollowup,
+                                secondAt + secondFollowup.size()) ==
+                          std::string::npos,
+                  "replying to a completed admin post resolves persisted source lineage and appends each follow-up once");
+        }
+        } catch (const std::exception& e) {
+            std::printf("  [FAIL] Discord manual intake section: %s\n",
+                        e.what());
+            ++failures;
+        }
 
         const std::string reviewSourceChannelId = "423456789012345670";
         const std::string reviewNotifyChannelId = "423456789012345690";

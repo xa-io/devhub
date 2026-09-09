@@ -88,6 +88,17 @@ struct ManualCaptureEffect {
     double targetScore = 1.0;
 };
 
+// Result of the direct-admin fast path. Only an exact active project mapping
+// on the source Discord channel enables automatic normal-priority promotion;
+// inferred/common-channel projects remain in the approval inbox.
+struct MappedManualPromotionOutcome {
+    bool mapped = false;
+    bool ok = false;
+    bool duplicate = false;
+    long long itemId = 0;
+    std::string error;
+};
+
 // One Discord message through the full pipeline: channel row find/create,
 // enabled check, suggestion/bug detection, project inference, insert,
 // last-read advance. Used by the embedded bot and the HTTP ingest API.
@@ -232,10 +243,18 @@ ManualCommandFailureOutcome recordManualCaptureEffectFailure(
     bool retryable);
 bool completeManualCaptureEffect(Db* db, long long commandRowId, int attempt);
 
+// Promote a completed direct admin capture at normal P2 when its Discord
+// channel has an exact active project mapping. Promotion retains the existing
+// atomic contributor-credit and notification-lineage transaction.
+MappedManualPromotionOutcome promoteMappedManualCapture(
+    Db* db, DiscordBot* bot, long long messageRowId);
+
 // Manual capture: an authorized admin directly mentions the bot or replies to
 // a user's message while mentioning it. Force-registers the direct ping or
-// replied-to message as a suggestion (score 100%, matched ["manual"]), with
-// eligible target/reply image metadata attached. adminNote (reply text minus
+// replied-to message as an explicit candidate (score 100%, matched with
+// "manual"). Configured bug detection retains `bug` so mapped cold entries
+// promote as fixes; unmatched content uses the suggestion fallback. Eligible
+// target/reply image metadata is attached. adminNote (reply text minus
 // the mention) is stored on the row, shown in the inbox, and carried onto the
 // item at promote time. Idempotent for already captured messages: kind is
 // upgraded / the note appended, never duplicated; a dismissed capture is
@@ -357,6 +376,29 @@ struct TicketLine {
     std::string title;
 };
 std::vector<TicketLine> ticketTitlesForProject(Db* db, long long projectId);
+
+// Cross-project active-ticket search for the authorized !xatickets command.
+// Matching includes title and body, but the projection deliberately carries
+// only ticket identity, project, and title into the Discord presentation path.
+struct TicketSearchEntry {
+    long long itemId = 0;
+    std::string projectName;
+    std::string title;
+};
+struct TicketSearchResult {
+    std::vector<TicketSearchEntry> entries;
+    std::size_t totalMatches = 0;
+};
+TicketSearchResult searchActiveTicketTitles(
+    Db* db, const std::string& query, std::size_t maxResults = 500);
+
+// Search cards use bounded, UTF-8-safe title previews and deterministic pages.
+// The ellipsis counts toward maxCharacters; controls/newlines become spaces.
+std::string ticketSearchTitlePreview(
+    const std::string& title, std::size_t maxCharacters = 50);
+std::vector<std::string> ticketSearchPages(
+    const std::vector<TicketSearchEntry>& entries,
+    std::size_t pageSize = 20, std::size_t maxTitleCharacters = 50);
 
 // Monitoring lookups for the embedded bot (each takes the DB guard itself).
 bool discordGuildEnabled(Db* db, const std::string& guildId);

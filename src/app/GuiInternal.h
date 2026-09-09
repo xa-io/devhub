@@ -336,7 +336,7 @@ struct App {
     PreservedText eiBodyValue;
     char eiReview[32]{}, eiBlocked[512]{}, eiAddSource[128]{};
     std::vector<Contributor> editContributors;
-    int eiMergeTarget = -1;
+    std::set<long long> eiMergeSourceIds;
     int eiType = 0, eiPrio = 1, eiStatus = 0;
     bool editProject = false;
     char epName[256]{}, epDesc[512]{}, epPath[512]{}, epRules[512]{};

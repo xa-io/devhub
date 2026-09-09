@@ -16,9 +16,11 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <sqlite3.h>
 
 using json = nlohmann::json;
@@ -26,11 +28,6 @@ using json = nlohmann::json;
 namespace devhub {
 
 // Item, contributor, merge, and status operations extracted from Ops.cpp.
-// Keeps a message's Discord notification card in sync with its item's
-// status (defined with the other card helpers below).
-void updateNotifyCardForItemLocked(Db::Held held, Db* db, DiscordBot* bot,
-                                          long long itemId,
-                                          const std::string& status);
 
 long long canonicalSourceIdLocked(Db::Held held, Db* db, long long sourceId) {
     if (!db || sourceId <= 0) return 0;
@@ -352,120 +349,177 @@ ON CONFLICT(item_id,source_id) DO UPDATE SET
     return true;
 }
 
-bool mergeItemsLocked(Db::Held held, Db* db, long long sourceItemId, long long targetItemId,
-                      std::string& error) {
-    if (sourceItemId <= 0 || targetItemId <= 0 || sourceItemId == targetItemId) {
-        error = "choose a different target item";
+bool mergeItemsLocked(Db::Held held, Db* db,
+                      const std::vector<long long>& sourceItemIds,
+                      long long targetItemId, std::string& error,
+                      DiscordBot* bot) {
+    error.clear();
+    if (!db || targetItemId <= 0 || sourceItemIds.empty()) {
+        error = "choose at least one source item and one target item";
         return false;
     }
-    long long sourceProject = 0, targetProject = 0;
-    std::string sourceTitle, sourceBody, sourceStatus, targetStatus;
-    auto readItem = [&](long long id, long long& project, std::string& title,
-                        std::string& body, std::string& status) {
+
+    std::set<long long> distinctIds{targetItemId};
+    for (long long sourceItemId : sourceItemIds) {
+        if (sourceItemId <= 0 || !distinctIds.insert(sourceItemId).second) {
+            error = "source and target items must be distinct";
+            return false;
+        }
+    }
+
+    struct MergeItem {
+        long long id = 0;
+        long long projectId = 0;
+        std::string title;
+        std::string body;
+        std::string status;
+        std::string updatedAt;
+    };
+    auto readItem = [&](long long id, MergeItem& item) {
         SQLite::Statement q(db->raw(held),
-            "SELECT project_id,title,body,status FROM items WHERE id=?");
+            "SELECT project_id,title,body,status,updated_at FROM items WHERE id=?");
         q.bind(1, id);
         if (!q.executeStep()) return false;
-        project = q.getColumn(0).getInt64(); title = q.getColumn(1).getString();
-        body = q.getColumn(2).getString(); status = q.getColumn(3).getString();
+        item.id = id;
+        item.projectId = q.getColumn(0).getInt64();
+        item.title = q.getColumn(1).getString();
+        item.body = q.getColumn(2).getString();
+        item.status = q.getColumn(3).getString();
+        item.updatedAt = q.getColumn(4).getString();
         return true;
     };
-    std::string targetTitle, targetBody;
-    if (!readItem(sourceItemId, sourceProject, sourceTitle, sourceBody, sourceStatus) ||
-        !readItem(targetItemId, targetProject, targetTitle, targetBody, targetStatus)) {
-        error = "item not found";
+
+    MergeItem targetItem;
+    if (!readItem(targetItemId, targetItem)) {
+        error = "target item not found";
         return false;
     }
-    if (sourceProject != targetProject) {
-        error = "feedback can only be merged within the same project";
-        return false;
-    }
-    if (sourceStatus == "merged" || targetStatus == "merged") {
+    if (targetItem.status == "merged") {
         error = "a merged audit record cannot be used as a merge target";
         return false;
     }
-    {
-        SQLite::Statement queuedImages(db->raw(held),
-            "SELECT COUNT(*) FROM ticket_attachments WHERE item_id IN (?,?) "
-            "AND state='queued'");
-        queuedImages.bind(1, sourceItemId);
-        queuedImages.bind(2, targetItemId);
-        queuedImages.executeStep();
-        if (queuedImages.getColumn(0).getInt64() > 0) {
-            error = "wait for queued ticket attachments to finish before merging";
+
+    std::vector<MergeItem> sourceItems;
+    sourceItems.reserve(sourceItemIds.size());
+    for (long long sourceItemId : sourceItemIds) {
+        MergeItem sourceItem;
+        if (!readItem(sourceItemId, sourceItem)) {
+            error = "source item not found";
             return false;
         }
-        SQLite::Statement imageTotals(db->raw(held),
-            "SELECT COUNT(*),COALESCE(SUM(actual_size),0) "
-            "FROM ticket_attachments WHERE item_id IN (?,?) "
-            "AND state='saved'");
-        imageTotals.bind(1, sourceItemId);
-        imageTotals.bind(2, targetItemId);
-        imageTotals.executeStep();
-        const long long imageCount = imageTotals.getColumn(0).getInt64();
-        const long long imageBytes = imageTotals.getColumn(1).getInt64();
-        if (imageCount > static_cast<long long>(kMaxTicketImages) ||
-            imageBytes > static_cast<long long>(kMaxTicketImageTotalBytes)) {
-            error =
-                "merge would exceed the 10-attachment or 50 MiB ticket limit";
+        if (sourceItem.projectId != targetItem.projectId) {
+            error = "tickets can only be merged within the same project";
             return false;
         }
+        if (sourceItem.status == "merged") {
+            error = "a merged audit record cannot be merged again";
+            return false;
+        }
+        sourceItems.push_back(std::move(sourceItem));
     }
 
-    SQLite::Transaction tx(db->raw(held));
-    SQLite::Statement transfer(db->raw(held),
-        "INSERT INTO item_sources(item_id,source_id,credited,added_at) "
-        "SELECT ?,source_id,credited,added_at FROM item_sources WHERE item_id=? "
-        "ON CONFLICT(item_id,source_id) DO UPDATE SET "
-        "credited=MAX(item_sources.credited,excluded.credited)");
-    transfer.bind(1, targetItemId); transfer.bind(2, sourceItemId); transfer.exec();
+    long long queuedImages = 0;
+    long long savedImages = 0;
+    long long savedImageBytes = 0;
+    auto addAttachmentTotals = [&](long long itemId) {
+        SQLite::Statement totals(db->raw(held), R"sql(
+SELECT COALESCE(SUM(CASE WHEN state='queued' THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN state='saved' THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN state='saved' THEN actual_size ELSE 0 END),0)
+FROM ticket_attachments WHERE item_id=?)sql");
+        totals.bind(1, itemId);
+        totals.executeStep();
+        queuedImages += totals.getColumn(0).getInt64();
+        savedImages += totals.getColumn(1).getInt64();
+        savedImageBytes += totals.getColumn(2).getInt64();
+    };
+    addAttachmentTotals(targetItem.id);
+    for (const MergeItem& sourceItem : sourceItems)
+        addAttachmentTotals(sourceItem.id);
+    if (queuedImages > 0) {
+        error = "wait for queued ticket attachments to finish before merging";
+        return false;
+    }
+    if (savedImages > static_cast<long long>(kMaxTicketImages) ||
+        savedImageBytes > static_cast<long long>(kMaxTicketImageTotalBytes)) {
+        error = "merge would exceed the 10-attachment or 50 MiB ticket limit";
+        return false;
+    }
 
-    std::string mergedText = targetBody;
-    if (!sourceTitle.empty() || !sourceBody.empty()) {
+    std::string mergedText = targetItem.body;
+    for (const MergeItem& sourceItem : sourceItems) {
+        if (sourceItem.title.empty() && sourceItem.body.empty()) continue;
         if (!mergedText.empty()) mergedText += "\n\n---\n";
-        mergedText += "Merged feedback: " + sourceTitle;
-        if (!sourceBody.empty()) mergedText += "\n\n" + sourceBody;
+        mergedText += "Merged feedback: " + sourceItem.title;
+        if (!sourceItem.body.empty()) mergedText += "\n\n" + sourceItem.body;
     }
+
+    std::string timestampFloor = targetItem.updatedAt;
+    for (const MergeItem& sourceItem : sourceItems)
+        if (sourceItem.updatedAt > timestampFloor)
+            timestampFloor = sourceItem.updatedAt;
+    const std::string mergedAt = nextIsoUtcAfter(timestampFloor);
+    SQLite::Transaction tx(db->raw(held));
     SQLite::Statement target(db->raw(held),
         "UPDATE items SET body=?,updated_at=? WHERE id=?");
-    target.bind(1, mergedText); target.bind(2, nowIsoUtc()); target.bind(3, targetItemId);
+    target.bind(1, mergedText); target.bind(2, mergedAt); target.bind(3, targetItemId);
     target.exec();
-    SQLite::Statement msg(db->raw(held),
-        "UPDATE discord_messages SET item_id=? WHERE item_id=?");
-    msg.bind(1, targetItemId); msg.bind(2, sourceItemId); msg.exec();
-    SQLite::Statement manualResults(db->raw(held),
-        "UPDATE discord_messages SET manual_result_item_id=? "
-        "WHERE manual_result_item_id=?");
-    manualResults.bind(1, targetItemId);
-    manualResults.bind(2, sourceItemId);
-    manualResults.exec();
-    SQLite::Statement cards(db->raw(held),
-        "UPDATE discord_notify_cards SET item_id=?,updated_at=? WHERE item_id=?");
-    cards.bind(1, targetItemId); cards.bind(2, nowIsoUtc());
-    cards.bind(3, sourceItemId); cards.exec();
-    SQLite::Statement images(db->raw(held),
-        "UPDATE ticket_attachments SET item_id=?,updated_at=? WHERE item_id=?");
-    images.bind(1, targetItemId); images.bind(2, nowIsoUtc());
-    images.bind(3, sourceItemId); images.exec();
-    SQLite::Statement audit(db->raw(held),
-        "INSERT INTO item_merges(source_item_id,target_item_id,merged_at) VALUES(?,?,?) "
-        "ON CONFLICT(source_item_id) DO UPDATE SET target_item_id=excluded.target_item_id,"
-        "merged_at=excluded.merged_at");
-    audit.bind(1, sourceItemId); audit.bind(2, targetItemId); audit.bind(3, nowIsoUtc());
-    audit.exec();
-    SQLite::Statement delLinks(db->raw(held), "DELETE FROM item_sources WHERE item_id=?");
-    delLinks.bind(1, sourceItemId); delLinks.exec();
-    SQLite::Statement source(db->raw(held),
-        "UPDATE items SET status='merged',credited=1,completed_at='',updated_at=? WHERE id=?");
-    source.bind(1, nowIsoUtc()); source.bind(2, sourceItemId); source.exec();
-    SQLite::Statement delEvents(db->raw(held),
-        "DELETE FROM events WHERE item_id=? AND kind='completion'");
-    delEvents.bind(1, sourceItemId); delEvents.exec();
+
+    for (const MergeItem& sourceItem : sourceItems) {
+        SQLite::Statement transfer(db->raw(held),
+            "INSERT INTO item_sources(item_id,source_id,credited,added_at) "
+            "SELECT ?,source_id,credited,added_at FROM item_sources WHERE item_id=? "
+            "ON CONFLICT(item_id,source_id) DO UPDATE SET "
+            "credited=MAX(item_sources.credited,excluded.credited)");
+        transfer.bind(1, targetItemId); transfer.bind(2, sourceItem.id); transfer.exec();
+        SQLite::Statement msg(db->raw(held),
+            "UPDATE discord_messages SET item_id=? WHERE item_id=?");
+        msg.bind(1, targetItemId); msg.bind(2, sourceItem.id); msg.exec();
+        SQLite::Statement manualResults(db->raw(held),
+            "UPDATE discord_messages SET manual_result_item_id=? "
+            "WHERE manual_result_item_id=?");
+        manualResults.bind(1, targetItemId);
+        manualResults.bind(2, sourceItem.id);
+        manualResults.exec();
+        SQLite::Statement cards(db->raw(held),
+            "UPDATE discord_notify_cards SET item_id=?,updated_at=? WHERE item_id=?");
+        cards.bind(1, targetItemId); cards.bind(2, mergedAt);
+        cards.bind(3, sourceItem.id); cards.exec();
+        SQLite::Statement images(db->raw(held),
+            "UPDATE ticket_attachments SET item_id=?,updated_at=? WHERE item_id=?");
+        images.bind(1, targetItemId); images.bind(2, mergedAt);
+        images.bind(3, sourceItem.id); images.exec();
+        SQLite::Statement audit(db->raw(held),
+            "INSERT INTO item_merges(source_item_id,target_item_id,merged_at) VALUES(?,?,?) "
+            "ON CONFLICT(source_item_id) DO UPDATE SET target_item_id=excluded.target_item_id,"
+            "merged_at=excluded.merged_at");
+        audit.bind(1, sourceItem.id); audit.bind(2, targetItemId);
+        audit.bind(3, mergedAt); audit.exec();
+        SQLite::Statement delLinks(db->raw(held),
+            "DELETE FROM item_sources WHERE item_id=?");
+        delLinks.bind(1, sourceItem.id); delLinks.exec();
+        SQLite::Statement source(db->raw(held),
+            "UPDATE items SET status='merged',credited=1,completed_at='',updated_at=? "
+            "WHERE id=?");
+        source.bind(1, mergedAt); source.bind(2, sourceItem.id); source.exec();
+        SQLite::Statement delEvents(db->raw(held),
+            "DELETE FROM events WHERE item_id=? AND kind='completion'");
+        delEvents.bind(1, sourceItem.id); delEvents.exec();
+        db->logActivity(held, "item_merged", targetItem.projectId,
+                        sourceItem.title + " -> " + targetItem.title);
+    }
     syncLegacyCreditLocked(held, db, targetItemId);
-    db->logActivity(held, "item_merged", sourceProject,
-                    sourceTitle + " -> " + targetTitle);
+    updateNotifyCardForItemLocked(held, db, bot, targetItemId,
+                                  targetItem.status);
     tx.commit();
     return true;
+}
+
+bool mergeItemsLocked(Db::Held held, Db* db, long long sourceItemId,
+                      long long targetItemId, std::string& error,
+                      DiscordBot* bot) {
+    return mergeItemsLocked(held, db, std::vector<long long>{sourceItemId},
+                            targetItemId, error, bot);
 }
 
 bool saveItemEditLocked(Db::Held held, Db* db, long long itemId, const ItemEdit& edit,
