@@ -113,7 +113,7 @@ struct Item {
     long long id = 0, projectId = 0;
     std::string project, type, title, body, status, source, origin, due, created, tags;
     std::string updated, reviewDate, blockedReason;
-    std::string completedAt; // filled by the credits drill-down
+    std::string completedAt; // project completion ordering and credits drill-down
     int priority = 2, credited = 0, sourceCount = 0, uncreditedCount = 0;
     int stale = 0, overdue = 0, reviewDue = 0;
 };

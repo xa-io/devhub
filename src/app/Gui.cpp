@@ -458,7 +458,9 @@ static void loadItems(App& a) {
         "i.priority, CASE WHEN COUNT(x.source_id)>0 AND "
         "IFNULL(SUM(CASE WHEN x.credited=0 THEN 1 ELSE 0 END),0)=0 THEN 1 ELSE 0 END, "
         "i.updated_at, i.review_date, i.blocked_reason, "
-        "COUNT(x.source_id), IFNULL(SUM(CASE WHEN x.credited=0 THEN 1 ELSE 0 END),0) "
+        "COUNT(x.source_id), IFNULL(SUM(CASE WHEN x.credited=0 THEN 1 ELSE 0 END),0), "
+        "CASE WHEN i.status='completed' THEN "
+        "IFNULL(strftime('%Y-%m-%dT%H:%M:%fZ', i.completed_at),'') ELSE '' END "
         "FROM items i LEFT JOIN item_sources x ON x.item_id=i.id "
         "LEFT JOIN sources s ON s.id=x.source_id WHERE i.project_id=? GROUP BY i.id "
         "ORDER BY CASE i.status WHEN 'in_progress' THEN 0 WHEN 'open' THEN 1 "
@@ -485,6 +487,7 @@ static void loadItems(App& a) {
         it.blockedReason = q.getColumn(c++).getString();
         it.sourceCount = q.getColumn(c++).getInt();
         it.uncreditedCount = q.getColumn(c++).getInt();
+        it.completedAt = q.getColumn(c++).getString();
         a.items.push_back(std::move(it));
     }
     a.needItems = false;
@@ -1623,6 +1626,12 @@ static void drawItemRow(App& a, Item& it, std::set<long long>& expanded) {
     }
     ImGui::TextColored(C_DIM, "%s", shortDate(it.created).c_str());
     ImGui::SameLine();
+    if (done) {
+        const std::string completedDate = it.completedAt.empty()
+            ? "unknown" : shortDate(it.completedAt);
+        chip(("completed: " + completedDate).c_str(), C_GREEN);
+        ImGui::SameLine();
+    }
     if (ImGui::SmallButton("edit")) openEditItem(a, it);
     ImGui::SameLine();
     if (ImGui::SmallButton("del")) a.deleteItemId = it.id;
@@ -1753,6 +1762,8 @@ static void drawProject(App& a) {
         "oldest submitted",
         "contributor A-Z",
         "contributor Z-A",
+        "newest completed",
+        "oldest completed",
     };
     ImGui::SetNextItemWidth(175.0f);
     ImGui::Combo("##projectItemSort", &a.projectItemSort, projectSorts,
@@ -1822,6 +1833,13 @@ static void drawProject(App& a) {
                         comparison =
                             toLower(left->source).compare(toLower(right->source));
                         break;
+                    case 7:
+                    case 8:
+                        // Missing completion dates follow dated rows in both directions.
+                        if (left->completedAt.empty() != right->completedAt.empty())
+                            return !left->completedAt.empty();
+                        comparison = left->completedAt.compare(right->completedAt);
+                        break;
                     default:
                         break;
                 }
@@ -1831,7 +1849,7 @@ static void drawProject(App& a) {
                         : left->id > right->id ? 1 : 0;
                 const bool descending =
                     a.projectItemSort == 2 || a.projectItemSort == 3 ||
-                    a.projectItemSort == 6;
+                    a.projectItemSort == 6 || a.projectItemSort == 7;
                 return descending ? comparison > 0 : comparison < 0;
             });
     }

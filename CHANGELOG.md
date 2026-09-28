@@ -2,6 +2,12 @@
 
 XA DevHub changes are listed newest first.
 
+## v1.0.7
+
+### Added
+
+- Show completion dates on ticket rows and order tickets by newest or oldest completion date, including the All and Completed tabs.
+
 ## v1.0.6
 
 ### Added
