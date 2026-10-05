@@ -85,8 +85,40 @@ bool discordChannelEnabled(Db* db, const std::string& channelId) {
 
 bool discordWatch(Db* db, const std::string& guildId,
                   const std::string& channelId) {
-    return discordGuildEnabled(db, guildId) ||
-           discordChannelEnabled(db, channelId);
+    if (channelId.empty()) return false;
+    auto lk = db->guard();
+    SQLite::Statement channel(db->raw(lk.token()),
+        "SELECT enabled FROM discord_channels WHERE channel_id=?");
+    channel.bind(1, channelId);
+    // Explicit channel choices always win, including disabled channels.
+    if (channel.executeStep()) return channel.getColumn(0).getInt() != 0;
+    if (db->getSetting(lk.token(), "discord_auto_add_channels") == "0" ||
+        guildId.empty()) return false;
+    SQLite::Statement guild(db->raw(lk.token()),
+        "SELECT enabled FROM discord_guilds WHERE guild_id=?");
+    guild.bind(1, guildId);
+    return guild.executeStep() && guild.getColumn(0).getInt() != 0;
+}
+
+void discordSetChannelMetadata(Db* db, const std::string& channelId,
+                               const std::string& name,
+                               const std::string& guildId,
+                               const std::string& guildName) {
+    if (channelId.empty() || name.empty()) return;
+    auto lk = db->guard();
+    // Metadata refresh never adds or enables a monitor.
+    SQLite::Statement up(db->raw(lk.token()),
+        "UPDATE discord_channels SET channel_name=?,"
+        "guild_id=CASE WHEN ?='' THEN guild_id ELSE ? END,"
+        "guild_name=CASE WHEN ?='' THEN guild_name ELSE ? END "
+        "WHERE channel_id=?");
+    up.bind(1, name);
+    up.bind(2, guildId);
+    up.bind(3, guildId);
+    up.bind(4, guildName);
+    up.bind(5, guildName);
+    up.bind(6, channelId);
+    up.exec();
 }
 
 std::string discordChannelLastRead(Db* db, const std::string& channelId) {
@@ -96,6 +128,17 @@ std::string discordChannelLastRead(Db* db, const std::string& channelId) {
     q.bind(1, channelId);
     if (q.executeStep()) return q.getColumn(0).getString();
     return {};
+}
+
+std::string discordNextUnnamedChannel(Db* db, long long& afterRowId) {
+    auto lk = db->guard();
+    SQLite::Statement q(db->raw(lk.token()),
+        "SELECT id,channel_id FROM discord_channels WHERE id>? "
+        "AND (channel_name='' OR channel_name=channel_id) ORDER BY id LIMIT 1");
+    q.bind(1, afterRowId);
+    if (!q.executeStep()) return {};
+    afterRowId = q.getColumn(0).getInt64();
+    return q.getColumn(1).getString();
 }
 
 void discordSetGuildName(Db* db, const std::string& guildId,

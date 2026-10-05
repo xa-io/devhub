@@ -193,6 +193,15 @@ DiscordReviewOutcome reviewNotificationCard(
     int approvalPriority = kDiscordReviewNormalPriority);
 bool pendingDiscordReviewCard(Db* db, const std::string& notifyChannelId,
                                const std::string& notifyMessageId);
+// Replies approve pending cards when possible, then append to the exact ticket.
+// Without a project, the note stays on the pending source for later promotion.
+// The reply's Discord ID, note, and attachment metadata commit together for
+// replay safety. Attachment-only replies are supported.
+DiscordReviewOutcome replyToNotificationCard(
+    Db* db, DiscordBot* bot, const std::string& notifyChannelId,
+    const std::string& notifyMessageId, const std::string& actorUserId,
+    const std::string& replyMessageId, const std::string& note,
+    const std::vector<DiscordAttachmentMeta>& attachments = {});
 // Exact terminal review-card lookup used before removing every reaction from
 // that bot-owned message. Missing, pending, and unrelated cards fail closed.
 bool terminalDiscordReviewCard(Db* db, const std::string& notifyChannelId,
@@ -405,6 +414,11 @@ bool discordGuildEnabled(Db* db, const std::string& guildId);
 bool discordChannelEnabled(Db* db, const std::string& channelId);
 bool discordWatch(Db* db, const std::string& guildId,
                   const std::string& channelId);
+void discordSetChannelMetadata(Db* db, const std::string& channelId,
+                               const std::string& name,
+                               const std::string& guildId,
+                               const std::string& guildName);
+std::string discordNextUnnamedChannel(Db* db, long long& afterRowId);
 std::string discordChannelLastRead(Db* db, const std::string& channelId);
 void discordSetGuildName(Db* db, const std::string& guildId,
                          const std::string& name);

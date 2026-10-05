@@ -1,10 +1,20 @@
 #pragma once
 
 #include "Db.h"
+#include "DiscordAttachment.h"
 
 #include <string>
+#include <vector>
 
 namespace devhub {
+
+struct TicketAttachmentStageResult {
+    int total = 0;
+    int changed = 0;
+};
+TicketAttachmentStageResult stageTicketAttachmentsLocked(
+    Db::Held held, Db* db, long long messageRowId,
+    const std::vector<DiscordAttachmentMeta>& attachments, long long itemId = 0);
 
 struct ManualCaptureClassification {
     std::string kind;

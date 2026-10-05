@@ -33,8 +33,8 @@ struct NotifyCard {
 };
 
 // Embedded Discord gateway client (D++). Connects with the token saved on
-// the Discord settings page, watches every text channel of monitored guilds
-// plus individually monitored channels, backfills history since each
+// the Discord settings page, discovers text channels of monitored guilds when
+// auto-add is enabled, watches explicitly enabled channels, backfills since each
 // channel's last-read timestamp, and feeds messages straight into the
 // ingest pipeline. No external bot process required.
 class DiscordBot {
@@ -118,7 +118,7 @@ private:
     // A whitelisted admin replied to an exact pending notification card with
     // a non-empty note. This route runs before watched-channel filtering so a
     // private notification channel (or configured existing DM channel) works.
-    bool maybeNotifyCardReviewReply(const void* msg); // dpp::message*
+    bool maybeNotifyCardReviewReply(const void* msg, bool liveEvent); // dpp::message*
     // Authorized mention commands are staged durably before any target REST
     // fetch. One bot-owned pump processes due commands so a transient fetch
     // failure or process restart cannot turn the command receipt into a
@@ -156,6 +156,7 @@ private:
     bool maybeTicketsCommand(const void* msg, bool liveEvent); // dpp::message*
     // Admin typed "!leaderboard": post the bounded public contributor table.
     bool maybeLeaderboardCommand(const void* msg, bool liveEvent); // dpp::message*
+    bool maybeHelpCommand(const void* msg, bool liveEvent); // dpp::message*
     // A number reaction landed on one of our menus: flip the card to that
     // project's open fix/implementation tickets.
     void handleReaction(const void* ev); // dpp::message_reaction_add_t*
@@ -193,6 +194,7 @@ private:
                                   const std::string& error = {},
                                   bool retryable = false);
     void backfillGuild(const void* guild); // dpp::guild*
+    void refreshChannelName(long long& afterRowId);
     // History sweeps run through a serial queue - one messages_get in
     // flight, spaced out, with retries. Firing every watched channel's
     // request concurrently trips D++'s https client ("Malformed HTTP

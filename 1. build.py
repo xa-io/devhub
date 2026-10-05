@@ -325,7 +325,22 @@ def banner(title: str) -> None:
     print(f"\n{line}\n{title}\n{line}")
 
 
+_section_title = ""
+_section_started = 0.0
+
+
+def finish_section() -> None:
+    global _section_title
+    if _section_title:
+        print(f"  [TIME] {_section_title}: {time.monotonic() - _section_started:.1f}s")
+        _section_title = ""
+
+
 def section(title: str) -> None:
+    global _section_title, _section_started
+    finish_section()
+    _section_title = title
+    _section_started = time.monotonic()
     print(f"\n[{title}]")
 
 
@@ -499,6 +514,7 @@ def run_command(
     progress_monitor: VcpkgProgressMonitor | None = None,
 ) -> subprocess.CompletedProcess[str]:
     normalized = [str(part) for part in command]
+    started_at = time.monotonic()
     print(f"  $ {command_text(normalized)}")
     progress_stop: threading.Event | None = None
     progress_thread: threading.Thread | None = None
@@ -531,6 +547,7 @@ def run_command(
             progress_stop.set()
         if progress_thread is not None:
             progress_thread.join(timeout=VCPKG_PROGRESS_POLL_SECONDS + 1.0)
+        print(f"  [TIME] {label}: {time.monotonic() - started_at:.1f}s")
     if capture and result.stdout:
         for line in result.stdout.rstrip().splitlines():
             print(f"    {line}")
@@ -635,14 +652,26 @@ def create_source_backup() -> Path:
 
     backup_dir.mkdir(parents=True)
     copied = 0
-    for source in PROJECT_DIR.rglob("*"):
-        if source.is_symlink() or not source.is_file() or is_backup_excluded(source):
-            continue
-        relative = source.relative_to(PROJECT_DIR)
-        destination = backup_dir / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        copied += 1
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    # Prune before descent: filtering rglob results still visits every file in
+    # old backups, the native build tree, and installed dependencies.
+    for directory, subdirs, filenames in os.walk(PROJECT_DIR, onerror=walk_error):
+        parent = Path(directory)
+        subdirs[:] = [name for name in subdirs
+                      if not (parent / name).is_symlink()
+                      and not getattr(parent / name, "is_junction", lambda: False)()
+                      and not is_backup_excluded(parent / name)]
+        for name in filenames:
+            source = parent / name
+            if source.is_symlink() or not source.is_file() or is_backup_excluded(source):
+                continue
+            relative = source.relative_to(PROJECT_DIR)
+            destination = backup_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            copied += 1
 
     if copied == 0:
         raise BuildFailure("Source backup did not capture any files.")
@@ -1189,8 +1218,11 @@ def build(verbose: bool, concurrency: int) -> None:
 
 
 def run_tests() -> None:
+    # The all-domain suite covers these same sections. Domain registrations
+    # remain available for targeted diagnosis without rerunning them here.
     run_command(
-        ["ctest", "--test-dir", BUILD_DIR, "-C", "Release", "--output-on-failure"],
+        ["ctest", "--test-dir", BUILD_DIR, "-C", "Release",
+         "--output-on-failure", "-LE", "domain"],
         label="CTest",
     )
     run_command([EXE_PATH, "--selftest"], label="DevHub self-test", capture=True)
@@ -1493,6 +1525,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    finally:
+        finish_section()
 
 
 def write_crash_log(exc: Exception) -> Path | None:

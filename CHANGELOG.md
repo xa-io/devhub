@@ -2,6 +2,12 @@
 
 XA DevHub changes are listed newest first.
 
+## Unreleased
+
+- Reduce build time by pruning excluded backup folders before traversal and avoiding repeated domain suites while retaining full application verification.
+- Report elapsed time for build stages and external commands, including failures.
+- Correct portable-export validation to retain Discord reply attribution while continuing to exclude administrator settings.
+
 ## v1.0.7
 
 ### Added

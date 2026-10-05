@@ -6,6 +6,7 @@
 // them here produces ABI-mismatched unresolved externals. All database
 // access goes through the plain-string bridge in Ingest.h.
 #include "DiscordBot.h"
+#include "DiscordCommandHelp.h"
 #include "Ingest.h"
 #include "Version.h"
 #include "devhub/DiscordRetry.h"
@@ -443,6 +444,34 @@ void DiscordBot::start(const std::string& token) {
                                   [&]() { handleMessage(&ev.msg, true); });
         });
 
+        // D++ does not reliably expose thread names through find_channel().
+        // Gateway metadata also refreshes disabled monitors without logging.
+        cluster->on_thread_create([this](const dpp::thread_create_t& ev) {
+            guardedDiscordHandler("thread-create metadata", [&]() {
+                discordSetChannelMetadata(db_,
+                    std::to_string((uint64_t)ev.created.id), ev.created.name,
+                    ev.created.guild_id ? std::to_string((uint64_t)ev.created.guild_id) : "",
+                    ev.creating_guild.name);
+            });
+        });
+        cluster->on_thread_update([this](const dpp::thread_update_t& ev) {
+            guardedDiscordHandler("thread-update metadata", [&]() {
+                discordSetChannelMetadata(db_,
+                    std::to_string((uint64_t)ev.updated.id), ev.updated.name,
+                    ev.updated.guild_id ? std::to_string((uint64_t)ev.updated.guild_id) : "",
+                    ev.updating_guild.name);
+            });
+        });
+        cluster->on_thread_list_sync([this](const dpp::thread_list_sync_t& ev) {
+            guardedDiscordHandler("thread-sync metadata", [&]() {
+                for (const auto& thread : ev.threads)
+                    discordSetChannelMetadata(db_,
+                        std::to_string((uint64_t)thread.id), thread.name,
+                        thread.guild_id ? std::to_string((uint64_t)thread.guild_id) : "",
+                        ev.updating_guild.name);
+            });
+        });
+
         cluster->on_message_update([this](const dpp::message_update_t& ev) {
             guardedDiscordHandler("message-update handler",
                                   [&]() { handleMessageUpdate(&ev.msg); });
@@ -510,19 +539,20 @@ void DiscordBot::start(const std::string& token) {
 
 void DiscordBot::handleMessage(const void* msgPtr, bool liveEvent) {
     const dpp::message& m = *static_cast<const dpp::message*>(msgPtr);
-    if (m.author.is_bot() || m.content.empty()) return;
+    if (m.author.is_bot() || (m.content.empty() && m.attachments.empty())) return;
 
     std::string chanId = std::to_string((uint64_t)m.channel_id);
     std::string guildId =
         m.guild_id ? std::to_string((uint64_t)m.guild_id) : std::string();
 
     // Admin commands work in ANY channel the bot can read (gated inside).
+    if (maybeHelpCommand(msgPtr, liveEvent)) return;
     if (maybeLeaderboardCommand(msgPtr, liveEvent)) return;
     if (maybeTicketsCommand(msgPtr, liveEvent)) return;
 
     // Exact replies to our pending review card must work even when the
     // configured private admin/DM channel is not a watched ingest channel.
-    if (maybeNotifyCardReviewReply(msgPtr)) return;
+    if (maybeNotifyCardReviewReply(msgPtr, liveEvent)) return;
 
     if (!discordWatch(db_, guildId, chanId)) return;
 
@@ -604,7 +634,7 @@ static std::string stripBotMention(std::string s, uint64_t botId) {
     return stripDiscordUserMention(std::move(s), std::to_string(botId));
 }
 
-bool DiscordBot::maybeNotifyCardReviewReply(const void* msgPtr) {
+bool DiscordBot::maybeNotifyCardReviewReply(const void* msgPtr, bool liveEvent) {
     const dpp::message& m = *static_cast<const dpp::message*>(msgPtr);
     const std::shared_ptr<dpp::cluster> cluster = lockCluster();
     if (!cluster || m.message_reference.message_id == 0 ||
@@ -616,11 +646,17 @@ bool DiscordBot::maybeNotifyCardReviewReply(const void* msgPtr) {
     const std::string channelId = std::to_string((uint64_t)m.channel_id);
     const std::string targetMessageId =
         std::to_string((uint64_t)m.message_reference.message_id);
+    // Old approval replies predate durable note receipts. History must not
+    // turn those replies into new follow-ups when reconnecting or rescanning.
+    if (!liveEvent)
+        return reviewNotificationCard(
+            db_, nullptr, channelId, targetMessageId, "", true).matched;
     const std::string actorId = std::to_string((uint64_t)m.author.id);
     const std::string note = stripBotMention(
         m.content, static_cast<uint64_t>(cluster->me.id));
+    const auto attachments = attachmentMetadata(m, "admin_reply");
 
-    if (note.empty()) {
+    if (note.empty() && attachments.empty()) {
         // Probe exact ownership with an intentionally unauthorized actor so an
         // empty reply can never approve. Exact-card replies are consumed; an
         // authorized author receives a visible retry cue.
@@ -633,21 +669,23 @@ bool DiscordBot::maybeNotifyCardReviewReply(const void* msgPtr) {
         return true;
     }
 
-    DiscordReviewOutcome outcome = reviewNotificationCard(
-        db_, this, channelId, targetMessageId, actorId, true, note);
+    DiscordReviewOutcome outcome = replyToNotificationCard(
+        db_, this, channelId, targetMessageId, actorId,
+        std::to_string((uint64_t)m.id), note, attachments);
     if (!outcome.matched) return false;
     if (!outcome.authorized) return true; // exact but unauthorized: inert
 
     addManualReaction(std::to_string((uint64_t)m.id), channelId,
-                      outcome.ok ? "\xE2\x9C\x85" : "\xE2\x9D\x8C");
+                      !outcome.ok ? "\xE2\x9D\x8C" :
+                      outcome.state == "new" ? "\xF0\x9F\x93\x9D" : "\xE2\x9C\x85");
     if (outcome.ok) {
-        appLog("[review] admin reply approved " +
+        appLog("[review] admin reply saved to " +
                (outcome.itemId > 0
                     ? "I" + std::to_string(outcome.itemId)
-                    : "an already-terminal card") +
+                    : "a pending card (project assignment required)") +
                (outcome.duplicate ? " (replay ignored)" : ""));
     } else {
-        appLog("[review] admin reply could not approve pending card: " +
+        appLog("[review] admin reply could not save ticket note: " +
                redactHttpUrls(outcome.error));
     }
     return true;
@@ -1470,8 +1508,37 @@ std::vector<DiscordAttachmentDownload> DiscordBot::downloadAttachments(
 }
 
 // ---------------------------------------------------------------------------
-// !leaderboard / !tickets: admin-only operator cards
+// Help, leaderboard and tickets: admin-only operator cards
 // ---------------------------------------------------------------------------
+
+bool DiscordBot::maybeHelpCommand(const void* msgPtr, bool liveEvent) {
+    const dpp::message& m = *static_cast<const dpp::message*>(msgPtr);
+    if (!lockCluster() || toLower(trim(m.content)) != "!xahelp") return false;
+    const std::string authorId = std::to_string((uint64_t)m.author.id);
+    if (!discordAdminUserAllowed(db_, authorId)) return false;
+
+    const std::string channelId = std::to_string((uint64_t)m.channel_id);
+    const std::string guildId = m.guild_id
+        ? std::to_string((uint64_t)m.guild_id) : std::string();
+    if (discordWatch(db_, guildId, channelId)) {
+        const auto* channel = dpp::find_channel(m.channel_id);
+        const auto* guild = m.guild_id ? dpp::find_guild(m.guild_id) : nullptr;
+        const IngestOutcome command = ingestDiscordMessage(
+            db_, channelId, channel ? channel->name : "", guildId,
+            guild ? guild->name : "", std::to_string((uint64_t)m.id),
+            displayName(m.author), authorId, m.content,
+            isoFromSnowflake((uint64_t)m.id), /*asCommand=*/true);
+        if (command.duplicate) return true;
+    }
+    // Backfills observe commands but must never post help on reconnect.
+    if (!liveEvent) return true;
+    NotifyCard card;
+    card.title = "XA DevHub commands";
+    card.description = discordCommandHelpText();
+    card.footer = DEVHUB_APP_NAME;
+    postCard(channelId, card, {});
+    return true;
+}
 
 bool DiscordBot::maybeLeaderboardCommand(const void* msgPtr, bool liveEvent) {
     const dpp::message& m = *static_cast<const dpp::message*>(msgPtr);
@@ -2614,18 +2681,42 @@ void DiscordBot::editCard(const std::string& channelId,
 void DiscordBot::backfillGuild(const void* guildPtr) {
     const dpp::guild* g = static_cast<const dpp::guild*>(guildPtr);
     std::string guildId = std::to_string((uint64_t)g->id);
-    bool wholeGuild = discordGuildEnabled(db_, guildId);
-
     for (dpp::snowflake cid : g->channels) {
         dpp::channel* ch = dpp::find_channel(cid);
         if (!ch || !ch->is_text_channel()) continue;
         std::string cidStr = std::to_string((uint64_t)cid);
-        if (!wholeGuild && !discordChannelEnabled(db_, cidStr)) continue;
+        if (!discordWatch(db_, guildId, cidStr)) continue;
         std::string lastRead = discordChannelLastRead(db_, cidStr);
         uint64_t after = lastRead.empty() ? 0 : snowflakeFromIso(lastRead);
         enqueueSweep({(uint64_t)cid, after, 0, /*retries=*/2});
     }
     pumpSweep();
+}
+
+void DiscordBot::refreshChannelName(long long& afterRowId) {
+    const auto cluster = lockCluster();
+    if (!cluster) return;
+    const std::string channelId = discordNextUnnamedChannel(db_, afterRowId);
+    if (channelId.empty()) {
+        afterRowId = -1; // End of pass; wait for the next rescan to retry.
+        return;
+    }
+    uint64_t id = 0;
+    if (!parseSnowflake(channelId, id)) return;
+    // One lookup per five seconds, one pass per rescan. Failed/deleted/private
+    // IDs retain their fallback and retry next pass without a tight loop.
+    cluster->channel_get(dpp::snowflake(id),
+        [this, cluster](const dpp::confirmation_callback_t& cc) {
+            guardedDiscordHandler("channel-name lookup", [&]() {
+                if (lockCluster() != cluster || cc.is_error()) return;
+                const auto& channel = std::get<dpp::channel>(cc.value);
+                const auto* guild = dpp::find_guild(channel.guild_id);
+                discordSetChannelMetadata(db_,
+                    std::to_string((uint64_t)channel.id), channel.name,
+                    channel.guild_id ? std::to_string((uint64_t)channel.guild_id) : "",
+                    guild ? guild->name : "");
+            });
+        });
 }
 
 void DiscordBot::enqueueSweep(const SweepJob& job, bool front) {
@@ -2769,6 +2860,7 @@ void DiscordBot::rescanWorker() {
     constexpr int kManualCommandPollSec = 5;
     int elapsed = 0;
     int manualElapsed = 0;
+    long long unnamedChannelCursor = 0;
     while (!rescanStop_) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (rescanStop_) break;
@@ -2777,7 +2869,11 @@ void DiscordBot::rescanWorker() {
         const bool notifyWake = resumeNotifyCards_.exchange(false);
         const bool manualWake = resumeManualCaptures_.exchange(false);
         const bool manualPoll = ++manualElapsed >= kManualCommandPollSec;
-        if (manualPoll) manualElapsed = 0;
+        if (manualPoll) {
+            manualElapsed = 0;
+            if (unnamedChannelCursor >= 0)
+                refreshChannelName(unnamedChannelCursor);
+        }
         // Commands/effects and card outbox claims stay responsive even when a
         // queued-image pass performs synchronous Discord downloads.
         if (notifyWake || imageWake || manualPoll)
@@ -2788,6 +2884,9 @@ void DiscordBot::rescanWorker() {
             resumeQueuedTicketImages(db_, this, /*recoverySweep=*/false);
         if (++elapsed < kIntervalSec) continue;
         elapsed = 0;
+        // Finish long passes before starting again so inaccessible IDs cannot
+        // starve later entries. Each pass includes disabled channel rows.
+        if (unnamedChannelCursor < 0) unnamedChannelCursor = 0;
         if (!lockCluster()) continue;
         // Also retry bounded queued work during the normal five-minute
         // recovery sweep in case a transient REST/CDN error did not require a

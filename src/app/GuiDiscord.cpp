@@ -1,4 +1,5 @@
 #include "GuiInternal.h"
+#include "DiscordCommandHelp.h"
 
 namespace devhub {
 
@@ -75,6 +76,22 @@ static void drawDiscordBotSection(App& a, const DiscordBot::Status& bs) {
             "portal (required - the gateway refuses the connection without it).");
     }
 
+    bool autoAddChannels;
+    {
+        auto lk = a.db->guard();
+        autoAddChannels =
+            a.db->getSetting(lk.token(), "discord_auto_add_channels") != "0";
+    }
+    if (ImGui::Checkbox("Auto Add Channels", &autoAddChannels)) {
+        auto lk = a.db->guard();
+        a.db->setSetting(lk.token(), "discord_auto_add_channels",
+                         autoAddChannels ? "1" : "0");
+    }
+    ImGui::TextWrapped(
+        "Automatically log newly discovered channels and threads in monitored "
+        "servers. When off, only existing enabled channel monitors are logged. "
+        "Changes apply immediately; existing monitor choices are preserved.");
+
     ImGui::SetNextItemWidth(420);
     ImGui::InputText("bot token", a.dcToken, sizeof(a.dcToken),
                      a.dcShowToken ? 0 : ImGuiInputTextFlags_Password);
@@ -95,7 +112,7 @@ static void drawDiscordBotSection(App& a, const DiscordBot::Status& bs) {
         "Enter Discord user IDs, not usernames. Separate multiple IDs with "
         "commas. This global whitelist can approve/capture messages in watched "
         "channels; approve or reject pending notification cards; reply with an "
-        "approval note; and use !tickets, !xatickets, !leaderboard, and menu "
+        "approval note; and use !tickets, !xatickets, !xahelp, !leaderboard, and menu "
         "reactions in every server the bot can read. Clear and save to disable "
         "these privileged actions; changes apply without reconnecting.");
     ImGui::PopTextWrapPos();
@@ -153,9 +170,9 @@ static void drawDiscordBotSection(App& a, const DiscordBot::Status& bs) {
 // per-server channel groups (each group's open state persists too).
 static void drawDiscordMonitors(App& a) {
     ImGui::TextColored(C_DIM,
-        "Server ID alone = monitor every channel in that server. Add a channel "
-        "ID to monitor just that channel. Channels the bot reads are listed "
-        "below automatically.");
+        "Server ID alone = discover channels when Auto Add Channels is on. "
+        "Add a channel or thread ID to monitor it individually. "
+        "Use each channel's on checkbox to control logging.");
     ImGui::SetNextItemWidth(190);
     ImGui::InputTextWithHint("##msrv", "server id", a.dcServerId, sizeof(a.dcServerId));
     ImGui::SameLine();
@@ -193,7 +210,7 @@ static void drawDiscordMonitors(App& a) {
             ins.exec();
             lk.unlock();
             a.needGuilds = true;
-            toast(a, "server monitor added - all channels will be watched");
+            toast(a, "server monitor added - discovery follows Auto Add Channels");
         } else {
             toast(a, "enter a server id (and optionally a channel id)", true);
         }
@@ -411,6 +428,20 @@ void drawDiscord(App& a) {
         botHdr += bs.state;
     if (sectionHeader(a, (botHdr + "###secbot").c_str(), "discord_bot", true))
         drawDiscordBotSection(a, bs);
+
+    // Commands are collapsed initially; sectionHeader persists the choice.
+    if (sectionHeader(a, "Commands", "discord_commands", false)) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(kDiscordCommandHelpAccess);
+        for (const auto& entry : kDiscordCommandHelp) {
+            ImGui::Spacing();
+            ImGui::TextColored(C_GREEN, "%s", entry.command);
+            ImGui::TextUnformatted(entry.description);
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted(kDiscordCommandHelpMention);
+        ImGui::PopTextWrapPos();
+    }
 
     // ---- bot notifications -------------------------------------------------
     if (sectionHeader(a, "Bot notifications", "discord_notify", false)) {

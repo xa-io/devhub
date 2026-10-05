@@ -1874,9 +1874,12 @@ static void drawProject(App& a) {
                 ++n;
         return n;
     };
+    int openCount = 0;
     int doneCount = 0;
-    for (const Item* it : projectRows)
+    for (const Item* it : projectRows) {
+        if (activeItemStatus(it->status)) ++openCount;
         if (it->status == "completed") ++doneCount;
+    }
     const int allCount = static_cast<int>(projectRows.size());
     if (!projectSearch.empty() || a.projectItemPriority != 0) {
         ImGui::SameLine();
@@ -1912,6 +1915,20 @@ static void drawProject(App& a) {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+        }
+        std::snprintf(lbl, sizeof(lbl), "Open (%d)###tabo", openCount);
+        if (ImGui::BeginTabItem(lbl)) {
+            ImGui::BeginChild("listo", ImVec2(0, 0));
+            for (Item* it : projectRows)
+                if (activeItemStatus(it->status))
+                    drawItemRow(a, *it, expanded);
+            if (openCount == 0)
+                ImGui::TextColored(
+                    C_DIM, (!projectSearch.empty() || a.projectItemPriority != 0)
+                        ? "No open tickets match the current filters."
+                        : "No open tickets.");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
         std::snprintf(lbl, sizeof(lbl), "Completed (%d)###tabc", doneCount);
         if (ImGui::BeginTabItem(lbl, nullptr,
@@ -2610,6 +2627,7 @@ static void refreshFrameCaches(App& a) {
     if (!interacting && now - a.lastAutoRefresh > 5.0) {
         a.lastAutoRefresh = now;
         a.needProjects = true;
+        if (a.page == Page::Project) a.needItems = true;
         if (a.page == Page::Work) a.needWork = true;
         if (a.page == Page::Knowledge) a.needKnowledge = true;
         if (a.page == Page::Discord) {

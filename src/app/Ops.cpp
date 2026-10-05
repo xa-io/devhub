@@ -146,15 +146,10 @@ static long long ensureChannelRowLocked(Db::Held held, Db* db, const std::string
     return rowId;
 }
 
-struct TicketAttachmentStageResult {
-    int total = 0;
-    int changed = 0;
-};
-
-static TicketAttachmentStageResult stageTicketAttachmentsLocked(
+TicketAttachmentStageResult stageTicketAttachmentsLocked(
     Db::Held held, Db* db, long long messageRowId,
     const std::vector<DiscordAttachmentMeta>& attachments,
-    long long itemId = 0) {
+    long long itemId) {
     TicketAttachmentStageResult result;
     if (messageRowId <= 0 || attachments.empty()) return result;
     const bool promoted = itemId > 0;
@@ -1994,6 +1989,7 @@ SELECT n.notify_channel_id,n.notify_message_id,n.item_id,m.id,COALESCE(m.state,'
         work.itemId = lineage.getColumn(c).getInt64();
     ++c;
     const bool sourcePresent = !lineage.getColumn(c).isNull();
+    const long long sourceRowId = sourcePresent ? lineage.getColumn(c).getInt64() : 0;
     ++c;
     const std::string sourceState = lineage.getColumn(c++).getString();
     const std::string author = lineage.getColumn(c++).getString();
@@ -2083,13 +2079,20 @@ SELECT n.notify_channel_id,n.notify_message_id,n.item_id,m.id,COALESCE(m.state,'
                             {"status", "new - waiting in the inbox"}};
         if (!adminNote.empty())
             work.card.fields.push_back({"admin note", snippet(adminNote, 300)});
+        SQLite::Statement captured(db->raw(held),
+            "SELECT COUNT(*) FROM ticket_attachments "
+            "WHERE discord_message_row_id=? AND state='captured'");
+        captured.bind(1, sourceRowId);
+        if (captured.executeStep() && captured.getColumn(0).getInt() > 0)
+            work.card.fields.push_back({"attachments",
+                std::to_string(captured.getColumn(0).getInt()) + " awaiting approval"});
         if (pendingProjectId > 0 && !pendingProject.empty())
             work.card.fields.push_back({"project", pendingProject});
         work.card.fields.push_back({
             "admin review",
             pendingProjectId > 0
                 ? "\xE2\x9C\x85 approve  \xE2\x80\xA2  \xE2\x9D\x8C reject  \xE2\x80\xA2  reply with a note to approve"
-                : "assign or map a project in DevHub before approval; \xE2\x9D\x8C rejects"});
+                : "assign or map a project in DevHub before approval; replies save notes without approving; \xE2\x9D\x8C rejects"});
         work.card.url = jumpUrl(guildId, channelId, messageId);
     }
     return !work.channelId.empty();

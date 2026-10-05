@@ -9,6 +9,7 @@ XA DevHub is a native Windows application that keeps software projects, tickets,
 ## What you can do
 
 - Track fixes, implementations, references, and notes with priorities, contributors, attachments, and completion history.
+- Browse all open project tickets in the Open tab, alongside Completed and All, while keeping the same search, priority filters, and sorting.
 - See each completed ticket's completion date and order project tickets by newest or oldest completion in the All or Completed tab, with tickets without a completion date listed last.
 - Compare local and public project versions and run your saved Build, Prep, Release, and Version commands.
 - Review Discord feedback, approve tickets, credit contributors, and retain follow-up evidence.
@@ -18,6 +19,8 @@ XA DevHub is a native Windows application that keeps software projects, tickets,
 ## Install and get started
 
 Get started by [building from source](CONTRIBUTING.md) and following the [DevHub guide](https://xadocs.com/devhub/). Portable binary packages, when available, will appear under [GitHub Releases](https://github.com/xa-io/devhub/releases).
+
+The numbered build workflow reports stage timings and runs the complete application tests without repeating overlapping domain suites. Source backups skip excluded build and dependency folders before scanning their contents.
 
 To install a portable package:
 

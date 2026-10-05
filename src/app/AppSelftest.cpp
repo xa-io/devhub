@@ -352,6 +352,65 @@ int devhub::runAppSelftest(std::string_view domain) {
         return 1;
     }
     std::string dbPath = (testDir / "devhub.db").string();
+    if (runAll || domain == "discord") section("Discord monitor discovery", [&] {
+        const std::string monitorPath = (testDir / "discord-monitors.db").string();
+        {
+            Db fixture(monitorPath);
+            {
+                auto lk = fixture.guard();
+                fixture.raw(lk.token()).exec(
+                    "INSERT INTO discord_guilds(guild_id,guild_name,created_at) "
+                    "VALUES('100','test guild','2026-10-02T00:00:00Z');"
+                    "INSERT INTO discord_channels(channel_id,guild_id,channel_name,enabled,created_at) "
+                    "VALUES('101','100','',1,'2026-10-02T00:00:00Z'),"
+                    "('102','100','102',0,'2026-10-02T00:00:00Z')");
+            }
+            check(discordWatch(&fixture, "100", "103") &&
+                      !discordWatch(&fixture, "999", "103") &&
+                      !discordWatch(&fixture, "100", "102"),
+                  "auto-add defaults on only for watched servers and respects disabled rows");
+            {
+                auto lk = fixture.guard();
+                fixture.setSetting(lk.token(), "discord_auto_add_channels", "0");
+            }
+            check(!discordWatch(&fixture, "100", "103") &&
+                      discordWatch(&fixture, "100", "101") &&
+                      !discordWatch(&fixture, "100", "102"),
+                  "auto-add off blocks new channels while preserving enabled and disabled monitors");
+            discordSetChannelMetadata(&fixture, "102", "Named thread", "100", "test guild");
+            discordSetChannelMetadata(&fixture, "102", "Renamed thread", "", "");
+            discordSetChannelMetadata(&fixture, "102", "", "", "");
+            discordSetChannelMetadata(&fixture, "103", "Untracked thread", "100", "test guild");
+            {
+                auto lk = fixture.guard();
+                SQLite::Statement row(fixture.raw(lk.token()),
+                    "SELECT channel_name,enabled,guild_id,guild_name FROM discord_channels WHERE channel_id='102'");
+                check(row.executeStep() && row.getColumn(0).getString() == "Renamed thread" &&
+                          row.getColumn(1).getInt() == 0 &&
+                          row.getColumn(2).getString() == "100" &&
+                          row.getColumn(3).getString() == "test guild" &&
+                          fixture.raw(lk.token()).execAndGet("SELECT COUNT(*) FROM discord_channels").getInt() == 2,
+                      "thread metadata preserves disabled state and guild, ignores empty names, and never adds monitors");
+            }
+            long long cursor = 0;
+            check(discordNextUnnamedChannel(&fixture, cursor) == "101" &&
+                      discordNextUnnamedChannel(&fixture, cursor).empty(),
+                  "metadata repair cursor advances past named threads");
+        }
+        {
+            Db reopened(monitorPath);
+            check(!discordWatch(&reopened, "100", "103") &&
+                      discordWatch(&reopened, "100", "101"),
+                  "auto-add off survives database reopen");
+            {
+                auto lk = reopened.guard();
+                reopened.setSetting(lk.token(), "discord_auto_add_channels", "1");
+            }
+            check(discordWatch(&reopened, "100", "103") &&
+                      !discordWatch(&reopened, "100", "102"),
+                  "re-enabling discovery preserves explicitly disabled monitors");
+        }
+    });
     if (runMigration) section("migration/schema", [&] {
         const std::string migrationPath = (testDir / "migration-v8.db").string();
         {
@@ -3778,6 +3837,63 @@ SELECT m.state,m.author,m.author_id,COALESCE(m.item_id,0),i.project_id,
                   "authorized reply approval promotes once at normal priority and appends its note exactly once");
         }
 
+        {
+            const std::string followup = "Card reply follow-up fixture";
+            auto denied = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, approvalNotifyMessageId,
+                "111111111111111111", "423456789012349001", followup);
+            auto empty = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, approvalNotifyMessageId,
+                "123456789012345678", "423456789012349001", "  ");
+            auto saved = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, approvalNotifyMessageId,
+                "123456789012345678", "423456789012349001", followup);
+            auto replay = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, approvalNotifyMessageId,
+                "123456789012345678", "423456789012349001", followup);
+            auto second = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, approvalNotifyMessageId,
+                "123456789012345678", "423456789012349002", followup);
+            auto lk = db.guard();
+            SQLite::Statement item(db.raw(lk.token()), "SELECT body FROM items WHERE id=?");
+            item.bind(1, approvedReview.itemId);
+            requireRow(item, "card reply target exists");
+            const std::string body = item.getColumn(0).getString();
+            const auto first = body.find(followup);
+            const auto next = first == std::string::npos ? first :
+                body.find(followup, first + followup.size());
+            check(!denied.authorized && !denied.ok && !empty.ok &&
+                      saved.ok && !saved.duplicate &&
+                      saved.itemId == approvedReview.itemId &&
+                      replay.ok && replay.duplicate && second.ok && !second.duplicate &&
+                      next != std::string::npos &&
+                      body.find(followup, next + followup.size()) == std::string::npos,
+                  "promoted card replies append once per Discord ID and reject unauthorized or empty notes");
+        }
+        {
+            const std::string cardId = "423456789012349010";
+            createReviewCard("423456789012349011", cardId,
+                "suggestion: pending card reply fixture", projectId);
+            auto saved = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, cardId,
+                "123456789012345678", "423456789012349012", "Pending card note");
+            auto replay = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, cardId,
+                "123456789012345678", "423456789012349012", "Pending card note");
+            check(saved.ok && saved.itemId > 0 && !saved.duplicate &&
+                      replay.ok && replay.duplicate && replay.itemId == saved.itemId,
+                  "pending card reply promotes then records its note with durable replay protection");
+            createReviewCard("423456789012349013", "423456789012349014",
+                "suggestion: dismissed card reply fixture", projectId);
+            reviewNotificationCard(&db, nullptr, reviewNotifyChannelId,
+                "423456789012349014", "123456789012345678", false);
+            auto dismissed = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, "423456789012349014",
+                "123456789012345678", "423456789012349015", "Do not append");
+            check(dismissed.matched && dismissed.authorized && !dismissed.ok,
+                  "dismissed card replies do not acknowledge an unsaved note");
+        }
+
         auto verifyPriorityApproval =
             [&](const std::string& sourceMessageId,
                 const std::string& notifyMessageId, int priority,
@@ -3883,6 +3999,109 @@ SELECT m.state,m.author,m.author_id,COALESCE(m.item_id,0),i.project_id,
                       !hasCard(approvalNotifyMessageId) &&
                       !hasCard(rejectNotifyMessageId),
                    "unmapped approval remains pending while reconnect seeding lists only active cards");
+        }
+
+        {
+            // Own this fixture: the cleanup test below needs its unmapped
+            // card to remain pending throughout the suite.
+            const std::string replyPendingCardId = "423456789012349021";
+            const auto replyPendingCapture = createReviewCard(
+                "423456789012349022", replyPendingCardId,
+                "suggestion: isolated pending reply fixture", 0);
+            const std::string note = "Keep this note before project assignment";
+            auto saved = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, replyPendingCardId,
+                "123456789012345678", "423456789012349020", note);
+            auto replay = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, replyPendingCardId,
+                "123456789012345678", "423456789012349020", note);
+            {
+                auto lk = db.guard();
+                SQLite::Statement pending(db.raw(lk.token()),
+                    "SELECT m.admin_note,m.state,COALESCE(m.item_id,0),n.edit_state "
+                    "FROM discord_messages m JOIN discord_notify_cards n "
+                    "ON n.discord_message_row_id=m.id WHERE m.id=?");
+                pending.bind(1, replyPendingCapture.messageRowId);
+                requireRow(pending, "unmapped reply note remains queryable");
+                check(saved.ok && saved.state == "new" && saved.itemId == 0 &&
+                          replay.ok && replay.duplicate &&
+                          pending.getColumn(0).getString() == note &&
+                          pending.getColumn(1).getString() == "new" &&
+                          pending.getColumn(2).getInt64() == 0 &&
+                          pending.getColumn(3).getString() == "pending",
+                      "unmapped card replies save their note once and queue a card refresh without approval");
+            }
+            const auto promoted = promoteSuggestion(
+                &db, nullptr, replyPendingCapture.messageRowId, projectId, "", "");
+            auto replayAfterPromotion = replyToNotificationCard(
+                &db, nullptr, reviewNotifyChannelId, replyPendingCardId,
+                "123456789012345678", "423456789012349020", note);
+            auto lk = db.guard();
+            SQLite::Statement item(db.raw(lk.token()), "SELECT body FROM items WHERE id=?");
+            item.bind(1, promoted.value("item_id", 0LL));
+            requireRow(item, "assigned ticket retains its pending note");
+            const std::string body = item.getColumn(0).getString();
+            const auto first = body.find(note);
+            check(promoted.value("ok", false) && replayAfterPromotion.ok &&
+                      replayAfterPromotion.duplicate && first != std::string::npos &&
+                      body.find(note, first + note.size()) == std::string::npos,
+                  "pending reply note survives later project assignment and promotion without replay duplication");
+        }
+
+        {
+            const std::string cardId = "423456789012349030";
+            const auto capture = createReviewCard("423456789012349031", cardId,
+                "suggestion: isolated attachment reply fixture", 0);
+            DiscordAttachmentMeta image;
+            image.attachmentId = "423456789012349032";
+            image.sourceMessageId = "423456789012349033";
+            image.sourceChannelId = reviewNotifyChannelId;
+            image.sourceRole = "admin_reply";
+            image.filename = "reply.png";
+            image.contentType = "image/png";
+            image.sizeBytes = 8;
+            auto saved = replyToNotificationCard(&db, nullptr,
+                reviewNotifyChannelId, cardId, "123456789012345678",
+                image.sourceMessageId, "", {image});
+            auto replay = replyToNotificationCard(&db, nullptr,
+                reviewNotifyChannelId, cardId, "123456789012345678",
+                image.sourceMessageId, "", {image});
+            {
+                auto lk = db.guard();
+                SQLite::Statement row(db.raw(lk.token()),
+                    "SELECT COUNT(*),MIN(state),COALESCE(MAX(item_id),0) "
+                    "FROM ticket_attachments WHERE discord_message_row_id=?");
+                row.bind(1, capture.messageRowId);
+                requireRow(row, "pending card image metadata query");
+                check(saved.ok && saved.state == "new" && replay.duplicate &&
+                          row.getColumn(0).getInt() == 1 &&
+                          row.getColumn(1).getString() == "captured" &&
+                          row.getColumn(2).getInt64() == 0,
+                      "attachment-only pending card replies capture one image without downloading or duplicating it");
+            }
+            const auto promotion = promoteSuggestion(
+                &db, nullptr, capture.messageRowId, projectId, "", "");
+            DiscordAttachmentMeta file = image;
+            file.attachmentId = "423456789012349034";
+            file.sourceMessageId = "423456789012349035";
+            file.filename = "reply.txt";
+            file.contentType = "text/plain";
+            auto fileSaved = replyToNotificationCard(&db, nullptr,
+                reviewNotifyChannelId, cardId, "123456789012345678",
+                file.sourceMessageId, "", {file});
+            auto fileReplay = replyToNotificationCard(&db, nullptr,
+                reviewNotifyChannelId, cardId, "123456789012345678",
+                file.sourceMessageId, "", {file});
+            auto lk = db.guard();
+            SQLite::Statement rows(db.raw(lk.token()),
+                "SELECT COUNT(*) FROM ticket_attachments "
+                "WHERE discord_message_row_id=? AND item_id=? AND state='queued'");
+            rows.bind(1, capture.messageRowId);
+            rows.bind(2, promotion.value("item_id", 0LL));
+            requireRow(rows, "promoted card attachment queue query");
+            check(promotion.value("ok", false) && fileSaved.ok && fileReplay.duplicate &&
+                      rows.getColumn(0).getInt() == 2,
+                  "promotion queues pending reply images and attachment-only promoted replies queue files exactly once");
         }
 
         IngestOutcome pendingEditCapture = createReviewCard(
@@ -6535,10 +6754,17 @@ VALUES(?,?,?,?,?,?,?,?,?,?))sql");
               portable.dump().find("discord_bot_token") == std::string::npos &&
               portable.dump().find("discord_admin_user_ids") == std::string::npos &&
               portable.dump().find("app_display_name") == std::string::npos &&
-              portable.dump().find("My Devhub") == std::string::npos &&
-              portable.dump().find("123456789012345678") == std::string::npos &&
-               portable.dump().find("987654321098765432") == std::string::npos,
+              portable.dump().find("My Devhub") == std::string::npos,
                "portable export normalizes legacy Windows bytes without mutating stored data and preserves contributor lineage");
+        // Administrator IDs are excluded as settings, but can legitimately
+        // appear as authors of captured Discord messages and card replies.
+        check(std::any_of(portable["discord_messages"].begin(),
+                          portable["discord_messages"].end(),
+                          [](const nlohmann::json& row) {
+                              return row.value("message_id", "") == "423456789012349001" &&
+                                  row.value("author_id", "") == "123456789012345678";
+                          }),
+              "portable export preserves card reply authors without exporting administrator settings");
 
         IngestOutcome atomicLineageCapture = ingestDiscordMessage(
             &db, detectedImage.sourceChannelId, "devhub",
