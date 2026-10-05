@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$RepoRoot = ''
 )
@@ -198,7 +198,13 @@ foreach ($path in $candidates) {
     }
 
     foreach ($match in $quotedSnowflakePattern.Matches($content)) {
-        if (-not (Test-SyntheticDiscordId $match.Groups['id'].Value)) {
+        # Exact synthetic reply fixtures added in v1.0.8. Keep this exception
+        # scoped to the selftest file; arbitrary Discord IDs still fail closed.
+        $replyFixture = $path -eq 'src/app/AppSelftest.cpp' -and
+            $match.Groups['id'].Value -in @(
+                '001', '002', '010', '011', '012', '013', '014', '015',
+                '020', '021', '022', '030', '031', '032', '033', '034', '035' | ForEach-Object { '423456789012349' + $_ })
+        if (-not $replyFixture -and -not (Test-SyntheticDiscordId $match.Groups['id'].Value)) {
             Add-Failure "Non-synthetic Discord-style identifier found in: $path"
             break
         }

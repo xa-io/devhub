@@ -2,11 +2,16 @@
 
 XA DevHub changes are listed newest first.
 
-## Unreleased
+## v1.0.8
 
-- Reduce build time by pruning excluded backup folders before traversal and avoiding repeated domain suites while retaining full application verification.
-- Report elapsed time for build stages and external commands, including failures.
-- Correct portable-export validation to retain Discord reply attribution while continuing to exclude administrator settings.
+- Added Open tab: View all open project tickets together while retaining search, priority filters, and sorting.
+- Added Discord > Commands: Browse bot commands and review actions, or use !xahelp as a whitelisted administrator.
+- Added Discord > Bot > Auto Add Channels: Control automatic channel discovery while preserving existing monitor selections.
+- Fixed Discord monitoring: Disabled channels stay excluded even when their server is monitored.
+- Updated Discord channel names: Refresh missing channel and thread names, including those for disabled monitors.
+- Updated Discord card replies: Save notes, files, and images on pending feedback or the linked ticket, with duplicate protection. Approval still requires a project.
+- Updated project tickets: Refresh the open project list automatically as feedback changes.
+- Improved builds: Reduce repeated backup and test work and display elapsed times for each stage.
 
 ## v1.0.7
 
