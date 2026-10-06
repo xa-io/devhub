@@ -214,7 +214,7 @@ CREATE INDEX IF NOT EXISTS idx_packet_snapshot_scope_project
 bool isPublicSettingKey(const std::string& key) {
     static const std::set<std::string> publicKeys = {
         "stale_days", "release_draft_days", "backup_retention",
-        "dashboard_completed_days", "show_log_panel",
+        "dashboard_completed_days", "show_log_panel", "ui_project_item_sort",
         "last_auto_maintenance", "leaderboard_excluded_source_ids",
         "app_display_name", "detection_patterns", "notify_guild_id",
         "notify_channel_id"

@@ -403,35 +403,25 @@ void drawModals(App& a) {
     if (ImGui::BeginPopupModal("Delete item?", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("Delete item #%lld permanently?", a.deleteItemId);
+        ImGui::TextUnformatted("Linked bot cards will be removed when Discord is available.");
         if (ImGui::Button("Delete")) {
             bool deleted = false;
-            bool hasNotifyCard = false;
-            {
-                auto lk = a.db->guard();
-                SQLite::Statement card(a.db->raw(lk.token()),
-                    "SELECT EXISTS(SELECT 1 FROM discord_notify_cards "
-                    "WHERE item_id=?)");
-                card.bind(1, a.deleteItemId);
-                card.executeStep();
-                hasNotifyCard = card.getColumn(0).getInt() != 0;
-                if (!hasNotifyCard) {
-                    SQLite::Statement del(a.db->raw(lk.token()),
-                        "DELETE FROM items WHERE id=?");
-                    del.bind(1, a.deleteItemId);
-                    deleted = del.exec() == 1;
-                }
+            std::string error = "item was not deleted";
+            try {
+                deleted = deleteItem(a.db, a.discord, a.deleteItemId);
+            } catch (const std::exception& e) {
+                error = e.what();
             }
-            if (hasNotifyCard) {
-                toast(a,
-                    "item has a Discord notification card; use won't do instead",
-                    true);
-            } else if (!deleted) {
-                toast(a, "item was not deleted", true);
+            if (!deleted) {
+                toast(a, error, true);
             } else {
                 a.deleteItemId = 0;
                 a.needItems = true;
                 a.needProjects = true;
                 a.needWork = true;
+                a.needCal = true;
+                a.needInbox = true;
+                a.needNotifyCounters = true;
                 ImGui::CloseCurrentPopup();
             }
         }

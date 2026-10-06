@@ -1766,8 +1766,12 @@ static void drawProject(App& a) {
         "oldest completed",
     };
     ImGui::SetNextItemWidth(175.0f);
-    ImGui::Combo("##projectItemSort", &a.projectItemSort, projectSorts,
-                 static_cast<int>(sizeof(projectSorts) / sizeof(projectSorts[0])));
+    if (ImGui::Combo("##projectItemSort", &a.projectItemSort, projectSorts,
+                    static_cast<int>(sizeof(projectSorts) / sizeof(projectSorts[0])))) {
+        auto lk = a.db->guard();
+        a.db->setSetting(lk.token(), "ui_project_item_sort",
+                         std::to_string(a.projectItemSort));
+    }
     ImGui::SameLine();
     static const char* projectPriorities[] = {
         "all priorities",
@@ -1785,6 +1789,8 @@ static void drawProject(App& a) {
         a.projectItemPriority != 0) {
         ImGui::SameLine();
         if (ImGui::SmallButton("reset")) {
+            auto lk = a.db->guard();
+            a.db->setSetting(lk.token(), "ui_project_item_sort", "0");
             a.projectItemSearch[0] = 0;
             a.projectItemSort = 0;
             a.projectItemPriority = 0;
@@ -3037,6 +3043,12 @@ int runGui(Db* db, BuildRunner* builds, VersionChecker* versions,
     {
         auto lk = db->guard();
         app.showLog = db->getSetting(lk.token(), "show_log_panel") == "1";
+        const std::string savedSort = db->getSetting(lk.token(), "ui_project_item_sort", "0");
+        // Only the nine defined choices are valid; missing or malformed
+        // preferences use priority / status.
+        app.projectItemSort = savedSort.size() == 1 &&
+                              savedSort[0] >= '0' && savedSort[0] <= '8'
+                                  ? savedSort[0] - '0' : 0;
         auto intSetting = [&](const char* key, int fallback) {
             try { return std::stoi(db->getSetting(lk.token(), key, std::to_string(fallback))); }
             catch (...) { return fallback; }

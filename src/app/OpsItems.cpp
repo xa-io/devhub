@@ -29,6 +29,61 @@ namespace devhub {
 
 // Item, contributor, merge, and status operations extracted from Ops.cpp.
 
+bool deleteItem(Db* db, DiscordBot* bot, long long itemId) {
+    if (!db || itemId <= 0) return false;
+    {
+        auto lk = db->guard();
+        SQLite::Transaction tx(db->raw(lk.token()));
+        SQLite::Statement exists(db->raw(lk.token()), "SELECT 1 FROM items WHERE id=?");
+        exists.bind(1, itemId);
+        if (!exists.executeStep()) return false;
+
+        // Persist exact bot-message identities before the item FK cascades.
+        // A POST still in flight is handled by finishNotifyPost's missing-row
+        // orphan path. No original user message is ever queued for deletion.
+        SQLite::Statement cleanup(db->raw(lk.token()), R"sql(
+INSERT OR IGNORE INTO discord_notify_orphans(
+    card_row_id,notify_channel_id,notify_message_id,created_at,updated_at)
+SELECT id,notify_channel_id,notify_message_id,?,?
+  FROM discord_notify_cards WHERE item_id=?
+   AND notify_channel_id!='' AND notify_message_id!=''
+UNION ALL
+SELECT 0,notify_channel_id,notify_message_id,?,?
+  FROM discord_messages WHERE item_id=?
+   AND notify_channel_id!='' AND notify_message_id!=''
+)sql");
+        const auto now = nowIsoUtc();
+        cleanup.bind(1, now); cleanup.bind(2, now); cleanup.bind(3, itemId);
+        cleanup.bind(4, now); cleanup.bind(5, now); cleanup.bind(6, itemId);
+        cleanup.exec();
+
+        // Retain terminal identities so history, reply and manual-command
+        // retries cannot recreate deleted work. Cancel pending manual effects.
+        SQLite::Statement scrub(db->raw(lk.token()), R"sql(
+UPDATE discord_messages SET state='deleted',author='',author_id='',content='',
+ posted_at='',ingested_at='',score=0,matched='[]',admin_note='',
+ inferred_project_id=NULL,notify_channel_id='',notify_message_id='',
+ manual_target_message_id='',manual_command_state='',manual_attempts=0,
+ manual_next_retry_at='',manual_last_error='',manual_result_kind='',
+ manual_result_message_row_id=0,manual_result_item_id=0,
+ manual_result_images_queued=0,manual_effect_state='',manual_effect_attempts=0,
+ manual_effect_next_retry_at='',manual_effect_error='',manual_effect_updated_at=''
+WHERE item_id=? OR manual_result_item_id=? OR id IN
+ (SELECT discord_message_row_id FROM discord_notify_cards WHERE item_id=?)
+)sql");
+        scrub.bind(1, itemId); scrub.bind(2, itemId); scrub.bind(3, itemId);
+        scrub.exec();
+        SQLite::Statement events(db->raw(lk.token()), "DELETE FROM events WHERE item_id=?");
+        events.bind(1, itemId); events.exec();
+        SQLite::Statement remove(db->raw(lk.token()), "DELETE FROM items WHERE id=?");
+        remove.bind(1, itemId);
+        if (remove.exec() != 1) return false;
+        tx.commit();
+    }
+    if (bot) bot->requestNotifyCardPost();
+    return true;
+}
+
 long long canonicalSourceIdLocked(Db::Held held, Db* db, long long sourceId) {
     if (!db || sourceId <= 0) return 0;
     std::vector<long long> seen;

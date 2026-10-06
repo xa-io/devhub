@@ -11,6 +11,9 @@ namespace devhub {
 
 class DiscordBot;
 
+// Deletes local work and queues removal of its bot-owned cards atomically.
+bool deleteItem(Db* db, DiscordBot* bot, long long itemId);
+
 struct ItemEdit {
     long long projectId = 0;
     std::string title;

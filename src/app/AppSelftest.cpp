@@ -352,6 +352,70 @@ int devhub::runAppSelftest(std::string_view domain) {
         return 1;
     }
     std::string dbPath = (testDir / "devhub.db").string();
+    if (runAll || domain == "discord") section("Delete Discord-linked tickets", [&] {
+        Db fixture((testDir / "delete-tickets.db").string());
+        {
+            auto lk = fixture.guard();
+            fixture.raw(lk.token()).exec(R"sql(
+INSERT INTO projects(id,name,created_at,updated_at) VALUES(900,'delete fixture','now','now');
+INSERT INTO items(id,project_id,title,created_at,updated_at) VALUES
+ (900,900,'posted','now','now'),(901,900,'posting','now','now'),(902,900,'plain','now','now');
+INSERT INTO discord_channels(id,channel_id,guild_id,channel_name,created_at)
+ VALUES(900,'900','900','fixture','now');
+INSERT INTO discord_messages(id,channel_row_id,message_id,content,ingested_at,state,item_id)
+ VALUES(900,900,'901','source','now','promoted',900),
+ (901,900,'902','reply','now','ignored',900);
+INSERT INTO discord_notify_cards(id,discord_message_row_id,item_id,notify_channel_id,
+ notify_message_id,post_state,created_at,updated_at) VALUES
+ (900,900,900,'903','904','posted','now','now'),
+ (901,NULL,901,'903','','posting','now','now');
+INSERT INTO ticket_attachments(discord_message_row_id,item_id,source_channel_id,
+ source_message_id,attachment_id,state,created_at,updated_at)
+ VALUES(900,900,'900','901','905','queued','now','now');
+CREATE TRIGGER block_test_delete BEFORE DELETE ON items
+ BEGIN SELECT RAISE(ABORT,'injected delete failure'); END;
+)sql");
+        }
+        bool rolledBack = false;
+        try { deleteItem(&fixture, nullptr, 900); }
+        catch (const std::exception&) { rolledBack = true; }
+        {
+            auto lk = fixture.guard();
+            SQLite::Statement state(fixture.raw(lk.token()),
+                "SELECT state,(SELECT COUNT(*) FROM discord_notify_orphans) "
+                "FROM discord_messages WHERE id=900");
+            requireRow(state, "failed delete rollback query");
+            check(rolledBack && state.getColumn(0).getString() == "promoted" &&
+                      state.getColumn(1).getInt() == 0,
+                  "failed ticket deletion rolls back source scrub and remote cleanup together");
+            fixture.raw(lk.token()).exec("DROP TRIGGER block_test_delete");
+        }
+        check(deleteItem(&fixture, nullptr, 900) &&
+                  deleteItem(&fixture, nullptr, 901) &&
+                  deleteItem(&fixture, nullptr, 902) &&
+                  !deleteItem(&fixture, nullptr, 900),
+              "posted, in-flight and plain tickets delete offline; repeated deletion is a no-op");
+        {
+            auto lk = fixture.guard();
+            SQLite::Statement state(fixture.raw(lk.token()), R"sql(
+SELECT (SELECT COUNT(*) FROM items),
+ (SELECT COUNT(*) FROM discord_notify_cards),
+ (SELECT COUNT(*) FROM ticket_attachments),
+ (SELECT COUNT(*) FROM discord_messages WHERE state='deleted' AND item_id IS NULL AND content=''),
+ (SELECT COUNT(*) FROM discord_notify_orphans WHERE notify_channel_id='903'
+     AND notify_message_id='904' AND cleanup_state='pending')
+)sql");
+            requireRow(state, "deleted ticket lineage query");
+            check(state.getColumn(0).getInt() == 0 && state.getColumn(1).getInt() == 0 &&
+                      state.getColumn(2).getInt() == 0 && state.getColumn(3).getInt() == 2 &&
+                      state.getColumn(4).getInt() == 1,
+                  "ticket deletion removes work and attachments, retains terminal identities and queues only the bot card");
+            SQLite::Statement fk(fixture.raw(lk.token()), "PRAGMA foreign_key_check");
+            check(!fk.executeStep(), "ticket deletion preserves foreign keys");
+        }
+        check(!promoteSuggestion(&fixture, nullptr, 900, 900, "", "").value("ok", false),
+              "deleted ticket source cannot be promoted again");
+    });
     if (runAll || domain == "discord") section("Discord monitor discovery", [&] {
         const std::string monitorPath = (testDir / "discord-monitors.db").string();
         {
@@ -3466,21 +3530,42 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
         ownedBuildHooks.injectedTerminationError = ERROR_PRIVILEGE_NOT_HELD;
         BuildRunner ownedBuilds(&db, ownedBuildHooks);
         std::string ownedBuildError;
+        // The build environment may omit System32 from PATH. Resolve the
+        // Windows helper explicitly rather than testing command discovery.
+        char systemDirectory[MAX_PATH]{};
+        const UINT systemDirectoryLength = GetSystemDirectoryA(systemDirectory, MAX_PATH);
+        if (systemDirectoryLength == 0 || systemDirectoryLength >= MAX_PATH)
+            throw std::runtime_error("could not resolve Windows system directory for shutdown fixture");
+        const std::string shutdownCommand =
+            "echo DEVHUB_SHUTDOWN_CHILD_READY && \"" +
+            std::string(systemDirectory, systemDirectoryLength) +
+            "\\ping.exe\" -n 30 127.0.0.1 >NUL";
         const long long ownedBuildId = ownedBuilds.start(
-            projectId, "build", "ping -n 30 127.0.0.1 >NUL",
+            projectId, "build", shutdownCommand,
             testDir.string(), "", ownedBuildError);
         std::string duplicateBuildError;
         const long long duplicateBuildId = ownedBuilds.start(
             projectId, "build", "cmd /C exit /B 0", testDir.string(), "",
             duplicateBuildError);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Wait for child output, not a scheduling-dependent startup delay.
+        bool ownedChildReady = false;
+        const auto readyDeadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(10);
+        while (ownedBuildId > 0 && std::chrono::steady_clock::now() < readyDeadline) {
+            const auto snapshot = ownedBuilds.status(ownedBuildId, 0);
+            ownedChildReady = snapshot.value("output", "").find(
+                "DEVHUB_SHUTDOWN_CHILD_READY") != std::string::npos;
+            if (ownedChildReady || snapshot.value("done", false)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
         const auto ownedStopStarted = std::chrono::steady_clock::now();
         ownedBuilds.stop();
         const auto ownedStopElapsed = std::chrono::steady_clock::now() -
                                       ownedStopStarted;
         const nlohmann::json ownedBuildStatus =
             ownedBuilds.status(ownedBuildId, 0);
-        check(ownedBuildId > 0 && ownedBuildError.empty() &&
+        const bool ownedStopPassed = ownedChildReady &&
+                   ownedBuildId > 0 && ownedBuildError.empty() &&
                    duplicateBuildId == 0 &&
                    duplicateBuildError.find("already") != std::string::npos &&
                    ownedStopElapsed < std::chrono::seconds(5) &&
@@ -3491,7 +3576,17 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
                         std::string::npos &&
                     ownedBuildStatus.value("output", "").find(
                         "child termination failed (error 1314)") !=
-                        std::string::npos,
+                        std::string::npos;
+        if (!ownedStopPassed) {
+            std::printf("selftest detail: shutdown ready=%d start=%lld duplicate=%lld "
+                        "stop_ms=%lld start_error=%s duplicate_error=%s status=%s\n",
+                        ownedChildReady ? 1 : 0, ownedBuildId, duplicateBuildId,
+                        static_cast<long long>(std::chrono::duration_cast<
+                            std::chrono::milliseconds>(ownedStopElapsed).count()),
+                        ownedBuildError.c_str(), duplicateBuildError.c_str(),
+                        ownedBuildStatus.dump().c_str());
+        }
+        check(ownedStopPassed,
               "owned build stop rejects a duplicate, terminates the child, preserves its injected Win32 diagnostic, and joins");
 
         } catch (const std::exception& e) {
