@@ -2,6 +2,18 @@
 
 XA DevHub changes are listed newest first.
 
+## Unreleased
+
+- Added a Discord button after Edit and Delete on project ticket rows to open the original captured message; disabled when no source message is available.
+- Updated project and Work Queue ticket search to include ticket numbers such as `i224`, alongside titles, details, and contributors.
+- Added a sortable Ticket column to Work Queue: `I` for implementations, `F` for fixes, and `O` for other tickets; these labels also work in ticket searches.
+
+## v1.0.9
+
+- Fixed ticket deletion: Delete tickets linked to Discord cards, queue bot-card removal while offline, and prevent replay from recreating deleted work.
+- Updated ticket sorting: Remember the selected sort order after reopening DevHub, including resetting to priority / status.
+- Fixed build verification: Resolve the Windows shutdown-test helper explicitly and wait for child readiness before testing shutdown.
+
 ## v1.0.8
 
 - Added Open tab: View all open project tickets together while retaining search, priority filters, and sorting.

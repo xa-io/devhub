@@ -460,7 +460,13 @@ static void loadItems(App& a) {
         "i.updated_at, i.review_date, i.blocked_reason, "
         "COUNT(x.source_id), IFNULL(SUM(CASE WHEN x.credited=0 THEN 1 ELSE 0 END),0), "
         "CASE WHEN i.status='completed' THEN "
-        "IFNULL(strftime('%Y-%m-%dT%H:%M:%fZ', i.completed_at),'') ELSE '' END "
+        "IFNULL(strftime('%Y-%m-%dT%H:%M:%fZ', i.completed_at),'') ELSE '' END, "
+        "IFNULL((SELECT 'https://discord.com/channels/' || dc.guild_id || '/' || "
+        "dc.channel_id || '/' || dm.message_id FROM discord_messages dm "
+        "JOIN discord_channels dc ON dc.id=dm.channel_row_id "
+        "WHERE dm.item_id=i.id AND dm.state='promoted' "
+        "AND dc.guild_id!='' AND dc.channel_id!='' AND dm.message_id!='' "
+        "ORDER BY dm.id LIMIT 1),'') "
         "FROM items i LEFT JOIN item_sources x ON x.item_id=i.id "
         "LEFT JOIN sources s ON s.id=x.source_id WHERE i.project_id=? GROUP BY i.id "
         "ORDER BY CASE i.status WHEN 'in_progress' THEN 0 WHEN 'open' THEN 1 "
@@ -488,6 +494,7 @@ static void loadItems(App& a) {
         it.sourceCount = q.getColumn(c++).getInt();
         it.uncreditedCount = q.getColumn(c++).getInt();
         it.completedAt = q.getColumn(c++).getString();
+        it.discordSourceUrl = q.getColumn(c++).getString();
         a.items.push_back(std::move(it));
     }
     a.needItems = false;
@@ -1328,6 +1335,12 @@ static void drawDashboard(App& a) {
     }
 }
 
+static std::string typedTicketLabel(const Item& it) {
+    const char* prefix = it.type == "implementation" ? "I" :
+                         it.type == "fix" ? "F" : "O";
+    return prefix + std::to_string(it.id);
+}
+
 static void drawWork(App& a) {
     ImGui::PushFont(a.fontBig);
     ImGui::TextUnformatted("Work Queue");
@@ -1336,7 +1349,7 @@ static void drawWork(App& a) {
         "One active queue across every project. Sort any column and combine filters.");
 
     ImGui::SetNextItemWidth(280);
-    ImGui::InputTextWithHint("##workSearch", "find title, details, contributor...",
+    ImGui::InputTextWithHint("##workSearch", "find ID, title, details, contributor...",
                              a.workSearch, sizeof(a.workSearch));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(190);
@@ -1381,7 +1394,9 @@ static void drawWork(App& a) {
         if (a.workFocus == 2 && !it.stale) continue;
         if (a.workFocus == 3 && !it.reviewDue) continue;
         if (a.workFocus == 4 && it.status != "blocked") continue;
-        if (!search.empty() && !containsCI(it.title, search) &&
+        if (!search.empty() && !containsCI("I" + std::to_string(it.id), search) &&
+            !containsCI(typedTicketLabel(it), search) &&
+            !containsCI(it.title, search) &&
             !containsCI(it.body, search) && !containsCI(it.project, search) &&
             !containsCI(it.source, search) && !containsCI(it.tags, search)) continue;
         rows.push_back(&it);
@@ -1389,11 +1404,12 @@ static void drawWork(App& a) {
     ImGui::TextColored(C_DIM, "%d shown / %d active", (int)rows.size(),
                        (int)a.workItems.size());
 
-    if (ImGui::BeginTable("workQueue", 8,
+    if (ImGui::BeginTable("workQueue", 9,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                           ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                           ImVec2(0, 0))) {
+        ImGui::TableSetupColumn("Ticket", ImGuiTableColumnFlags_WidthFixed, 80, 8);
         ImGui::TableSetupColumn("Project", ImGuiTableColumnFlags_DefaultSort, 1.25f, 0);
         ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 2.6f, 1);
         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 95, 2);
@@ -1422,6 +1438,7 @@ static void drawWork(App& a) {
                     }
                     case 6: cmp = l->updated.compare(r->updated); break;
                     case 7: cmp = l->source.compare(r->source); break;
+                    case 8: cmp = l->id < r->id ? -1 : l->id > r->id ? 1 : 0; break;
                 }
                 if (cmp == 0) cmp = l->id < r->id ? -1 : l->id > r->id ? 1 : 0;
                 return s.SortDirection == ImGuiSortDirection_Ascending ? cmp < 0 : cmp > 0;
@@ -1430,6 +1447,8 @@ static void drawWork(App& a) {
         for (Item* it : rows) {
             ImGui::PushID((int)it->id);
             ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(typedTicketLabel(*it).c_str());
             ImGui::TableNextColumn(); ImGui::TextUnformatted(it->project.c_str());
             ImGui::TableNextColumn();
             if (ImGui::Selectable((it->title + "##workitem").c_str(), false,
@@ -1635,6 +1654,14 @@ static void drawItemRow(App& a, Item& it, std::set<long long>& expanded) {
     if (ImGui::SmallButton("edit")) openEditItem(a, it);
     ImGui::SameLine();
     if (ImGui::SmallButton("del")) a.deleteItemId = it.id;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(it.discordSourceUrl.empty());
+    if (ImGui::SmallButton("discord")) openUrl(it.discordSourceUrl);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(it.discordSourceUrl.empty()
+            ? "No original Discord message available"
+            : "Open original message in Discord");
 
     if (isOpen) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, C_BG2);
@@ -1750,7 +1777,7 @@ static void drawProject(App& a) {
     ImGui::Spacing();
     ImGui::SetNextItemWidth(300.0f);
     ImGui::InputTextWithHint("##projectItemSearch",
-                             "search title, details, or contributor...",
+                             "search ID, title, details, contributor...",
                              a.projectItemSearch,
                              sizeof(a.projectItemSearch));
     ImGui::SameLine();
@@ -1801,7 +1828,10 @@ static void drawProject(App& a) {
     // tabs
     static std::set<long long> expanded;
     auto matchesProjectSearch = [&](const Item& it) {
-        return projectSearch.empty() || containsCI(it.title, projectSearch) ||
+        return projectSearch.empty() ||
+               containsCI("I" + std::to_string(it.id), projectSearch) ||
+               containsCI(typedTicketLabel(it), projectSearch) ||
+               containsCI(it.title, projectSearch) ||
                containsCI(it.body, projectSearch) ||
                containsCI(it.source, projectSearch);
     };

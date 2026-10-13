@@ -114,6 +114,7 @@ struct Item {
     std::string project, type, title, body, status, source, origin, due, created, tags;
     std::string updated, reviewDate, blockedReason;
     std::string completedAt; // project completion ordering and credits drill-down
+    std::string discordSourceUrl; // original captured message, not the bot card
     int priority = 2, credited = 0, sourceCount = 0, uncreditedCount = 0;
     int stale = 0, overdue = 0, reviewDue = 0;
 };
