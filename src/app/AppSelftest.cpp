@@ -8,6 +8,7 @@
 #include "BuildRunner.h"
 #include "DataMaintenance.h"
 #include "Db.h"
+#include "DiscordAccess.h"
 #include "DiscordBot.h"
 #include "Gui.h"
 #include "KnowledgeOps.h"
@@ -415,6 +416,181 @@ SELECT (SELECT COUNT(*) FROM items),
         }
         check(!promoteSuggestion(&fixture, nullptr, 900, 900, "", "").value("ok", false),
               "deleted ticket source cannot be promoted again");
+    });
+    if (runAll || domain == "discord") section("Discord Access Management", [&] {
+        const std::string accessPath = (testDir / "discord-access.db").string();
+        Db fixture(accessPath);
+        std::string error;
+        check(discordAccessRules(&fixture, &error).empty() && error.empty(),
+              "access automation starts with no configured rules");
+        std::uint64_t parsed = 0;
+        check(parseDiscordAccessSnowflake("18446744073709551615", parsed) &&
+                  !parseDiscordAccessSnowflake("18446744073709551616", parsed) &&
+                  !parseDiscordAccessSnowflake("0", parsed) &&
+                  !parseDiscordAccessSnowflake("+101", parsed),
+              "access snowflakes use bounded unsigned decimal values");
+        check(discordAccessFilenameMatches("XA-Zod-v0.0.0.6.zip", "XA-Zod-v") &&
+                  discordAccessFilenameMatches("xa-zod-v7.ZIP", "XA-Zod-v") &&
+                  !discordAccessFilenameMatches("other-XA-Zod-v7.zip", "XA-Zod-v") &&
+                  !discordAccessFilenameMatches("XA-Zod-v7.zip.exe", "XA-Zod-v") &&
+                  !discordAccessFilenameMatches("XA-Zod-v7/other.zip", "XA-Zod-v") &&
+                  !discordAccessFilenameMatches("XA-Zod-v7.zip", ""),
+              "access matching requires a literal prefix and final ZIP extension without paths");
+        check(!saveDiscordAccessRule(&fixture, "0", "XA-Zod-v", true, 0, &error) &&
+                  !saveDiscordAccessRule(&fixture, "101", "", true, 0, &error) &&
+                  !saveDiscordAccessRule(&fixture, "101", "*.zip", true, 0, &error) &&
+                  !saveDiscordAccessRule(&fixture, "101", "../XA-", true, 0, &error) &&
+                  discordAccessRules(&fixture).empty(),
+              "invalid access rules fail without creating configuration");
+        check(saveDiscordAccessRule(&fixture, "00101", " XA-Zod-v ", false, 0, &error),
+              "access rule saves a canonical channel ID and literal prefix");
+        auto current = [&]() { return discordAccessRules(&fixture).at(0); };
+        DiscordAccessRule rule = current();
+        check(rule.channelId == "101" && rule.filenamePrefix == "XA-Zod-v" &&
+                  !rule.enabled && rule.revision > 0 &&
+                  rule.scanAfterMessageId == rule.watchAfterMessageId &&
+                  parseDiscordAccessSnowflake(rule.watchAfterMessageId, parsed),
+              "new access rules persist a positive activation and catch-up watermark");
+        auto message = [&](std::uint64_t offset) {
+            std::uint64_t baseline = 0;
+            parseDiscordAccessSnowflake(current().watchAfterMessageId, baseline);
+            return std::to_string(baseline + offset);
+        };
+        {
+            auto lk = fixture.guard();
+            fixture.setSetting(lk.token(), "discord_admin_user_ids", "111");
+        }
+        check(!queueDiscordAccessUpload(&fixture, "101", "201", message(10), "111",
+                                       {"XA-Zod-v1.zip"}),
+              "disabled access rules never stage pin work");
+        check(saveDiscordAccessRule(&fixture, "101", "XA-Zod-v", true, rule.revision, &error),
+              "access rule can be enabled explicitly");
+        const DiscordAccessRule enabled = current();
+        check(!saveDiscordAccessRule(&fixture, "101", "XA-Other-v", true, rule.revision, &error) &&
+                  current().filenamePrefix == "XA-Zod-v" &&
+                  !advanceDiscordAccessScan(&fixture, rule, message(100)),
+              "stale access editor and scan snapshots cannot change a newer configuration");
+        check(!queueDiscordAccessUpload(&fixture, "101", "201", message(10), "112", {"XA-Zod-v1.zip"}) &&
+                  !queueDiscordAccessUpload(&fixture, "102", "201", message(10), "111", {"XA-Zod-v1.zip"}) &&
+                  !queueDiscordAccessUpload(&fixture, "101", "201", message(10), "111", {"XA-Zod-v1.zip.exe"}) &&
+                  !queueDiscordAccessUpload(&fixture, "101", "201", enabled.watchAfterMessageId,
+                                           "111", {"XA-Zod-v1.zip"}),
+              "access intake rejects unauthorized authors, other channels, wrong files and pre-activation uploads");
+        const std::string firstMessage = message(10);
+        check(queueDiscordAccessUpload(&fixture, "101", "201", firstMessage, "111",
+                                       {"notes.txt", "xa-zod-v1.ZIP"}, &error, enabled.revision),
+              "authorized matching offline or live uploads stage metadata without downloading bytes");
+        const DiscordAccessRule firstWork = current();
+        check(!queueDiscordAccessUpload(&fixture, "101", "201", firstMessage, "111", {"XA-Zod-v1.zip"}) &&
+                  !queueDiscordAccessUpload(&fixture, "101", "201", message(9), "111", {"XA-Zod-v0.zip"}) &&
+                  dueDiscordAccessRules(&fixture).size() == 1,
+              "duplicate and out-of-order access uploads do not replace the latest candidate");
+        check(saveDiscordAccessRule(&fixture, "101", "XA-Zod-v", true, enabled.revision, &error) &&
+                  current().latestMessageId == firstMessage && current().revision == enabled.revision,
+              "unchanged access configuration preserves concurrent runtime work");
+        const std::string secondMessage = message(20);
+        check(queueDiscordAccessUpload(&fixture, "101", "201", secondMessage, "111", {"XA-Zod-v2.zip"}) &&
+                  !discordAccessWorkCurrent(&fixture, firstWork) &&
+                  !finishDiscordAccessWork(&fixture, firstWork, true),
+              "a newer access upload invalidates callbacks for the older candidate");
+        DiscordAccessRule work = current();
+        check(advanceDiscordAccessScan(&fixture, firstWork, message(30), &error) &&
+                  current().latestMessageId == secondMessage &&
+                  !advanceDiscordAccessScan(&fixture, work, message(29), &error),
+              "access scan watermark advances across live candidates but cannot move backward");
+        check(recordDiscordAccessScanError(&fixture, work,
+                  "lookup failed https://cdn.discordapp.com/private?secret=1", &error) &&
+                  current().lastScanError.find("secret=1") == std::string::npos &&
+                  current().lastError.empty() &&
+                  recordDiscordAccessScanError(&fixture, work, "", &error) &&
+                  !recordDiscordAccessScanError(&fixture, work, "", &error),
+              "access history failures are independently visible and redact URLs");
+        check(finishDiscordAccessWork(&fixture, work, false, "temporary HTTP 503", true, &error) &&
+                  current().status == "retry" && current().attempts == 1 &&
+                  current().pinnedMessageId.empty() &&
+                  dueDiscordAccessRules(&fixture, "2000-01-01T00:00:00Z").empty() &&
+                  dueDiscordAccessRules(&fixture, "2999-01-01T00:00:00Z").size() == 1 &&
+                  !finishDiscordAccessWork(&fixture, work, false, "duplicate callback", true),
+              "access failure preserves pins, backs off, and ignores duplicate callback outcomes");
+        {
+            Db reopened(accessPath);
+            const auto persisted = discordAccessRules(&reopened);
+            check(persisted.size() == 1 && persisted[0].latestMessageId == secondMessage &&
+                      persisted[0].status == "retry" && persisted[0].attempts == 1 &&
+                      persisted[0].scanAfterMessageId == current().scanAfterMessageId,
+                  "access retry candidate and offline history watermark survive database reopen");
+        }
+        for (unsigned attempt = 1; attempt < 5; ++attempt) {
+            work = current();
+            check(finishDiscordAccessWork(&fixture, work, false, "temporary failure", true),
+                  "access retry outcome advances its bounded attempt count");
+        }
+        work = current();
+        check(work.status == "failed" && work.attempts == 5 &&
+                  work.nextRetryAt.empty() && dueDiscordAccessRules(&fixture).empty(),
+              "access retry exhaustion stays visibly failed instead of retrying forever");
+        check(retryDiscordAccessRule(&fixture, "101", work.revision, &error) &&
+                  current().revision != work.revision && current().attempts == 0 &&
+                  current().status == "pending" && !discordAccessWorkCurrent(&fixture, work),
+              "explicit access retry renews the revision and invalidates earlier callbacks");
+        work = current();
+        check(finishDiscordAccessWork(&fixture, work, true, {}, false, &error) &&
+                  current().status == "synced" && current().pinnedMessageId == secondMessage &&
+                  !current().lastSuccessAt.empty() && dueDiscordAccessRules(&fixture).empty(),
+              "only a complete access pin operation records synchronized success");
+        check(queueDiscordAccessUpload(&fixture, "101", "201", message(40), "111", {"XA-Zod-v3.zip"}),
+              "a later access release stages new work after success");
+        work = current();
+        check(finishDiscordAccessWork(&fixture, work, false, "missing Pin Messages permission", false) &&
+                  current().status == "failed" && current().pinnedMessageId == secondMessage,
+              "permanent access failure preserves the previously successful pin identity");
+        check(retryDiscordAccessRule(&fixture, "101", work.revision, &error),
+              "authorized operator can retry a failed access operation");
+        work = current();
+        {
+            auto lk = fixture.guard();
+            fixture.setSetting(lk.token(), "discord_admin_user_ids", "");
+        }
+        check(!discordAccessWorkCurrent(&fixture, work) &&
+                  !finishDiscordAccessWork(&fixture, work, true) &&
+                  finishDiscordAccessWork(&fixture, work, false, "author authorization revoked", false),
+              "revocation blocks the next access REST stage while its terminal failure remains recordable");
+        check(!retryDiscordAccessRule(&fixture, "101", work.revision, &error) &&
+                  !queueDiscordAccessUpload(&fixture, "101", "201", message(50), "111", {"XA-Zod-v4.zip"}),
+              "revoked admin authorization blocks access retries and new uploads immediately");
+        check(saveDiscordAccessRule(&fixture, "101", "XA-Other-v", false, work.revision, &error) &&
+                  !discordAccessConfigCurrent(&fixture, work) &&
+                  !recordDiscordAccessScanError(&fixture, work, "late error") &&
+                  current().latestMessageId.empty() && current().pinnedMessageId == secondMessage,
+              "reconfiguration cancels pending access work while retaining the previous success record");
+        const DiscordAccessRule removed = current();
+        check(removeDiscordAccessRule(&fixture, "101", removed.revision, &error) &&
+                  saveDiscordAccessRule(&fixture, "101", "XA-Zod-v", true, 0, &error) &&
+                  current().revision > removed.revision &&
+                  !discordAccessConfigCurrent(&fixture, removed) &&
+                  !queueDiscordAccessUpload(&fixture, "101", "201", message(60), "111",
+                                           {"XA-Zod-v5.zip"}, &error, removed.revision),
+              "remove and recreate never reuse an access configuration revision");
+        {
+            auto lk = fixture.guard();
+            fixture.setSetting(lk.token(), "discord_access_management", "{malformed private value");
+        }
+        check(discordAccessRules(&fixture, &error).empty() && !error.empty() &&
+                  !saveDiscordAccessRule(&fixture, "102", "XA-Zod-v", false, 0, &error),
+              "malformed saved access policy fails closed for readers and writers");
+        {
+            auto lk = fixture.guard();
+            check(fixture.getSetting(lk.token(), "discord_access_management") == "{malformed private value",
+                  "access policy errors preserve the original stored document");
+        }
+        Db bounded((testDir / "discord-access-bounds.db").string());
+        bool allSaved = true;
+        for (unsigned i = 0; i < 100; ++i)
+            allSaved = saveDiscordAccessRule(&bounded, std::to_string(1000 + i),
+                                             "XA-v", false, 0, &error) && allSaved;
+        check(allSaved && !saveDiscordAccessRule(&bounded, "2000", "XA-v", false, 0, &error) &&
+                  discordAccessRules(&bounded).size() == 100,
+              "access policy bounds the channel rule inventory at 100 without dropping saved rules");
     });
     if (runAll || domain == "discord") section("Discord monitor discovery", [&] {
         const std::string monitorPath = (testDir / "discord-monitors.db").string();

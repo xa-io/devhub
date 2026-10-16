@@ -108,6 +108,8 @@ public:
     bool stopRequested() const { return rescanStop_.load(); }
 
 private:
+    // Independent serial lane for opt-in release pins and offline catch-up.
+    void accessManagementWorker();
     void handleMessage(const void* msg, bool liveEvent); // dpp::message*
     void handleMessageUpdate(const void* msg); // dpp::message*
     // An authorized admin mentioned the bot: a reply force-captures the target
@@ -217,6 +219,7 @@ private:
     std::chrono::steady_clock::time_point warnAt_{}; // when st_.warn was set
     std::set<uint64_t> seenGuilds_;
     std::thread rescanTh_;
+    std::thread accessManagementTh_;
     std::thread manualCaptureWatchdogTh_;
     std::atomic<bool> rescanStop_{false};
     std::atomic<bool> resumeTicketImages_{false};

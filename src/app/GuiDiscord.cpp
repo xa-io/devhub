@@ -113,7 +113,8 @@ static void drawDiscordBotSection(App& a, const DiscordBot::Status& bs) {
         "commas. This global whitelist can approve/capture messages in watched "
         "channels; approve or reject pending notification cards; reply with an "
         "approval note; and use !tickets, !xatickets, !xahelp, !leaderboard, and menu "
-        "reactions in every server the bot can read. Clear and save to disable "
+        "reactions in every server the bot can read. Access Management uses this "
+        "whitelist for matching upload pins. Clear and save to disable "
         "these privileged actions; changes apply without reconnecting.");
     ImGui::PopTextWrapPos();
     ImGui::SetNextItemWidth(420);
@@ -391,6 +392,228 @@ static void drawDiscordMonitors(App& a) {
                                                       : slugify(gname)),
                           true))
             drawChannelTable(list);
+        ImGui::PopID();
+    }
+}
+
+static std::string discordAccessChannelLabel(const App& a,
+                                             const std::string& channelId) {
+    for (const auto& channel : a.channels) {
+        if (channel.channelId != channelId) continue;
+        const std::string name = channel.name.empty()
+            ? channelId : channel.name;
+        return (channel.guild.empty() ? "" : channel.guild + " / ") +
+               "#" + name + " (" + channelId + ")";
+    }
+    return channelId;
+}
+
+static void clearDiscordAccessEditor(App& a) {
+    a.dcAccessChannel[0] = a.dcAccessPrefix[0] = 0;
+    a.dcAccessPrefixValue = {};
+    a.dcAccessEditRevision = 0;
+    a.dcAccessEnabled = false;
+}
+
+static void drawDiscordAccessManagement(App& a) {
+    const bool interacting = ImGui::IsAnyItemActive() ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                    ImGuiPopupFlags_AnyPopupLevel);
+    const double now = ImGui::GetTime();
+    if (!a.dcAccessLoaded || (!interacting && now >= a.dcAccessRefreshAt)) {
+        a.dcAccessRules = discordAccessRules(a.db, &a.dcAccessLoadError);
+        a.dcAccessLoaded = true;
+        a.dcAccessRefreshAt = now + 5.0;
+    }
+
+    ImGui::TextWrapped(
+        "Keep the latest matching ZIP upload pinned in each selected channel. "
+        "Only uploads by the Bot section's admin/developer whitelist qualify. "
+        "The new message is pinned before older matching upload pins are removed; "
+        "other pins are kept.");
+    ImGui::TextWrapped(
+        "Monitoring begins when a rule is enabled and catches up on uploads "
+        "missed while DevHub is offline. Changing the prefix or re-enabling a "
+        "rule starts a new watch period. Earlier uploads do not trigger updates.");
+    ImGui::TextWrapped(
+        "Bot permissions: View Channel, Read Message History, Pin Messages.");
+    if (a.discord->status().state != "connected")
+        ImGui::TextColored(C_ORANGE,
+            "Pin updates will resume when the bot reconnects.");
+
+    std::string configuredAdmins;
+    {
+        auto lk = a.db->guard();
+        configuredAdmins = a.db->getSetting(lk.token(), "discord_admin_user_ids");
+    }
+    std::vector<std::string> admins;
+    if (!parseDiscordAdminUserIds(configuredAdmins, admins) || admins.empty()) {
+        ImGui::TextColored(C_ORANGE,
+            "Save an admin/developer whitelist under Bot to allow pin updates.");
+    }
+    if (!a.dcAccessLoadError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, C_RED);
+        ImGui::TextWrapped("Access rules could not be loaded: %s",
+                           a.dcAccessLoadError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    const bool editing = a.dcAccessEditRevision != 0;
+    ImGui::SeparatorText(editing ? "Edit access rule" : "Add access rule");
+    ImGui::BeginDisabled(!a.dcAccessLoadError.empty());
+    ImGui::BeginDisabled(editing);
+    const std::string selectedChannel = a.dcAccessChannel[0]
+        ? discordAccessChannelLabel(a, a.dcAccessChannel)
+        : "Choose a known channel";
+    ImGui::SetNextItemWidth(480);
+    if (ImGui::BeginCombo("channel##access", selectedChannel.c_str())) {
+        if (a.channels.empty()) ImGui::TextDisabled("No known channels yet");
+        for (const auto& channel : a.channels) {
+            std::uint64_t parsed = 0;
+            if (!parseDiscordAccessSnowflake(channel.channelId, parsed)) continue;
+            const bool selected = channel.channelId == a.dcAccessChannel;
+            const std::string label =
+                discordAccessChannelLabel(a, channel.channelId);
+            ImGui::PushID(channel.channelId.c_str());
+            if (ImGui::Selectable(label.c_str(), selected))
+                copyBuf(a.dcAccessChannel, sizeof(a.dcAccessChannel),
+                        channel.channelId);
+            if (selected) ImGui::SetItemDefaultFocus();
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("channel ID##access", "or enter an exact channel ID",
+                            a.dcAccessChannel, sizeof(a.dcAccessChannel));
+    ImGui::EndDisabled();
+    if (a.dcAccessPrefixValue.truncated) {
+        ImGui::TextColored(C_ORANGE,
+            "This saved prefix is too long for the editor and will be preserved.");
+    }
+    ImGui::BeginDisabled(a.dcAccessPrefixValue.truncated);
+    ImGui::SetNextItemWidth(360);
+    ImGui::InputTextWithHint("filename prefix##access", "XA-Zod-v",
+                            a.dcAccessPrefix, sizeof(a.dcAccessPrefix));
+    ImGui::EndDisabled();
+    ImGui::TextColored(C_DIM,
+        "Literal prefix, ignoring letter case; ZIP attachments only. One rule per channel.");
+    ImGui::Checkbox("Enabled##access_editor", &a.dcAccessEnabled);
+    if (ImGui::Button(editing ? "Save rule##access" : "Add rule##access")) {
+        std::string error;
+        if (saveDiscordAccessRule(a.db, trim(a.dcAccessChannel),
+                preservedText(a.dcAccessPrefix, a.dcAccessPrefixValue),
+                a.dcAccessEnabled, a.dcAccessEditRevision, &error)) {
+            clearDiscordAccessEditor(a);
+            a.dcAccessLoaded = false;
+            toast(a, editing ? "access rule saved" : "access rule added");
+        } else {
+            toast(a, "access rule not saved - " + error, true);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(editing ? "Cancel edit##access" : "Clear##access"))
+        clearDiscordAccessEditor(a);
+    ImGui::EndDisabled();
+
+    ImGui::SeparatorText("Channel rules");
+    if (a.dcAccessRules.empty()) {
+        ImGui::TextColored(C_DIM, "No access rules configured.");
+        return;
+    }
+    for (const auto& rule : a.dcAccessRules) {
+        ImGui::PushID(rule.channelId.c_str());
+        ImGui::BeginChild("access_rule", ImVec2(0, 0),
+                         ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+        const std::string channelLabel = discordAccessChannelLabel(a, rule.channelId);
+        ImGui::TextUnformatted(channelLabel.c_str());
+        ImGui::TextWrapped("ZIP prefix: %s", rule.filenamePrefix.c_str());
+        const bool isBeingEdited = editing && rule.channelId == a.dcAccessChannel;
+        bool enabled = rule.enabled;
+        ImGui::BeginDisabled(isBeingEdited || !a.dcAccessLoadError.empty());
+        if (ImGui::Checkbox("Enabled", &enabled)) {
+            std::string error;
+            if (saveDiscordAccessRule(a.db, rule.channelId, rule.filenamePrefix,
+                                      enabled, rule.revision, &error)) {
+                a.dcAccessLoaded = false;
+                toast(a, enabled ? "access monitoring enabled"
+                                 : "access monitoring disabled - pins retained");
+            } else {
+                toast(a, "access rule not changed - " + error, true);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("edit")) {
+            copyBuf(a.dcAccessChannel, sizeof(a.dcAccessChannel), rule.channelId);
+            loadPreservedText(a.dcAccessPrefix, sizeof(a.dcAccessPrefix),
+                              rule.filenamePrefix, a.dcAccessPrefixValue);
+            a.dcAccessEnabled = rule.enabled;
+            a.dcAccessEditRevision = rule.revision;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!rule.enabled ||
+            (rule.status != "failed" && rule.status != "retry"));
+        if (ImGui::SmallButton("retry")) {
+            std::string error;
+            if (retryDiscordAccessRule(a.db, rule.channelId, rule.revision, &error)) {
+                a.dcAccessLoaded = false;
+                toast(a, "access pin update queued for retry");
+            } else {
+                toast(a, "access retry not queued - " + error, true);
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("remove")) {
+            std::string error;
+            if (removeDiscordAccessRule(a.db, rule.channelId, rule.revision, &error)) {
+                a.dcAccessLoaded = false;
+                toast(a, "access rule removed - pins retained");
+            } else {
+                toast(a, "access rule not removed - " + error, true);
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Stop watching this channel and keep its current pins.");
+        ImGui::EndDisabled();
+
+        const char* state = !rule.enabled ? "disabled"
+            : !rule.lastScanError.empty() ? "upload check needs attention"
+            : rule.status == "synced" ? "up to date"
+            : rule.status == "pending" ? "pin update pending"
+            : rule.status == "retry" ? "retry scheduled"
+            : rule.status == "failed" ? "needs attention"
+            : "waiting for a matching upload";
+        const ImVec4 color = !rule.enabled ? C_DIM
+            : !rule.lastScanError.empty() ? C_ORANGE
+            : rule.status == "synced" ? C_GREEN
+            : rule.status == "failed" ? C_RED
+            : rule.status == "retry" ? C_ORANGE : C_DIM;
+        ImGui::TextColored(color, "%s", state);
+        if (!rule.latestFilename.empty())
+            ImGui::TextWrapped("Latest match: %s", rule.latestFilename.c_str());
+        if (!rule.lastSuccessAt.empty())
+            ImGui::TextColored(C_DIM, "Last pin update: %s",
+                               shortTs(rule.lastSuccessAt).c_str());
+        if (!rule.nextRetryAt.empty() && rule.enabled && rule.status == "retry")
+            ImGui::TextColored(C_DIM, "Next retry: %s",
+                               shortTs(rule.nextRetryAt).c_str());
+        if (!rule.lastError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, C_ORANGE);
+            ImGui::TextWrapped("%s", rule.lastError.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!rule.lastScanError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, C_ORANGE);
+            ImGui::TextWrapped("Upload check: %s", rule.lastScanError.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!rule.latestGuildId.empty() && !rule.latestMessageId.empty()) {
+            if (ImGui::SmallButton("open latest upload"))
+                openUrl("https://discord.com/channels/" + rule.latestGuildId +
+                        "/" + rule.channelId + "/" + rule.latestMessageId);
+        }
+        ImGui::EndChild();
         ImGui::PopID();
     }
 }
@@ -940,6 +1163,9 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
 
     if (sectionHeader(a, "Monitors", "discord_monitors", true))
         drawDiscordMonitors(a);
+
+    if (sectionHeader(a, "Access Management", "discord_access", false))
+        drawDiscordAccessManagement(a);
 
     ImGui::SeparatorText("Inbox");
     ImGui::TextColored(C_DIM,

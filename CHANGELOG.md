@@ -2,8 +2,9 @@
 
 XA DevHub changes are listed newest first.
 
-## Unreleased
+## v1.0.10 - 2026-10-14
 
+- Added Access Management below Discord Monitors to pin the newest matching admin ZIP upload, replace older matching release pins, and catch up after time offline.
 - Added a Discord button after Edit and Delete on project ticket rows to open the original captured message; disabled when no source message is available.
 - Updated project and Work Queue ticket search to include ticket numbers such as `i224`, alongside titles, details, and contributors.
 - Added a sortable Ticket column to Work Queue: `I` for implementations, `F` for fixes, and `O` for other tickets; these labels also work in ticket searches.

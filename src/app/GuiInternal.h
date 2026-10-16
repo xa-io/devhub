@@ -5,6 +5,7 @@
 #include "BuildRunner.h"
 #include "DataMaintenance.h"
 #include "Db.h"
+#include "DiscordAccess.h"
 #include "DiscordBot.h"
 #include "KnowledgeOps.h"
 #include "Ops.h"
@@ -360,6 +361,14 @@ struct App {
     char dcServerId[64]{}, dcChanId[64]{}, dcMonName[128]{};
     char dcPatterns[32768]{}; bool dcPatternsLoaded = false;
     char dcNotifyGuild[64]{}, dcNotifyChan[64]{}; bool dcNotifyLoaded = false;
+    std::vector<DiscordAccessRule> dcAccessRules;
+    bool dcAccessLoaded = false;
+    double dcAccessRefreshAt = 0;
+    std::string dcAccessLoadError;
+    char dcAccessChannel[64]{}, dcAccessPrefix[512]{};
+    PreservedText dcAccessPrefixValue;
+    std::uint64_t dcAccessEditRevision = 0;
+    bool dcAccessEnabled = false;
     // event popup
     char evTitle[256]{}, evNotes[512]{};
     int evKind = 0, evProject = 0;

@@ -13,6 +13,7 @@ XA DevHub is a native Windows application that keeps software projects, tickets,
 - See each completed ticket's completion date and order project tickets by newest or oldest completion in the All or Completed tab, with tickets without a completion date listed last.
 - Compare local and public project versions and run your saved Build, Prep, Release, and Version commands.
 - Review Discord feedback, approve tickets, credit contributors, and retain follow-up evidence.
+- Keep the newest ZIP release pinned with Discord > Access Management: choose a channel and filename prefix, reuse the admin whitelist, and catch uploads missed while DevHub was offline.
 - Keep durable knowledge, development workflows, reports, and resumable AI handoffs alongside your projects.
 - Back up your data and export portable Markdown or JSON.
 

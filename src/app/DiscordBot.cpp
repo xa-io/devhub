@@ -6,6 +6,7 @@
 // them here produces ABI-mismatched unresolved externals. All database
 // access goes through the plain-string bridge in Ingest.h.
 #include "DiscordBot.h"
+#include "DiscordAccess.h"
 #include "DiscordCommandHelp.h"
 #include "Ingest.h"
 #include "Version.h"
@@ -254,6 +255,7 @@ void DiscordBot::stop() {
         dying.swap(cluster_);
     }
     if (rescanTh_.joinable()) rescanTh_.join();
+    if (accessManagementTh_.joinable()) accessManagementTh_.join();
     if (manualCaptureWatchdogTh_.joinable())
         manualCaptureWatchdogTh_.join();
     if (dying) {
@@ -509,6 +511,10 @@ void DiscordBot::start(const std::string& token) {
         cluster->start(dpp::st_return);
 
         rescanStop_ = false;
+        accessManagementTh_ = std::thread([this]() {
+            guardedDiscordHandler("access management worker",
+                                  [this]() { accessManagementWorker(); });
+        });
         rescanTh_ = std::thread([this]() {
             guardedDiscordHandler("rescan worker",
                                   [this]() { rescanWorker(); });
@@ -521,6 +527,7 @@ void DiscordBot::start(const std::string& token) {
     } catch (const std::exception& e) {
         rescanStop_ = true;
         if (rescanTh_.joinable()) rescanTh_.join();
+        if (accessManagementTh_.joinable()) accessManagementTh_.join();
         if (manualCaptureWatchdogTh_.joinable())
             manualCaptureWatchdogTh_.join();
         {
@@ -544,6 +551,17 @@ void DiscordBot::handleMessage(const void* msgPtr, bool liveEvent) {
     std::string chanId = std::to_string((uint64_t)m.channel_id);
     std::string guildId =
         m.guild_id ? std::to_string((uint64_t)m.guild_id) : std::string();
+
+    // Access rules are independent of ticket capture monitors. History catch-up
+    // has its own activation watermark; ticket rescan and edits never replay it.
+    if (liveEvent && m.guild_id && !m.webhook_id && !m.attachments.empty()) {
+        std::vector<std::string> filenames;
+        for (const auto& attachment : m.attachments)
+            if (!attachment.ephemeral) filenames.push_back(attachment.filename);
+        queueDiscordAccessUpload(db_, chanId, guildId,
+            std::to_string((uint64_t)m.id),
+            std::to_string((uint64_t)m.author.id), filenames);
+    }
 
     // Admin commands work in ANY channel the bot can read (gated inside).
     if (maybeHelpCommand(msgPtr, liveEvent)) return;

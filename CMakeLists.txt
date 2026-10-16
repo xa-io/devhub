@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xa_devhub VERSION 1.0.10 LANGUAGES CXX)
+project(xa_devhub VERSION 1.0.11 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,6 +60,8 @@ add_library(devhub_app STATIC
     src/app/BuildRunner.cpp
     src/app/DataMaintenance.cpp
     src/app/Db.cpp
+    src/app/DiscordAccessBot.cpp
+    src/app/DiscordAccessOps.cpp
     src/app/DiscordBot.cpp
     src/app/DiscordIntakeOps.cpp
     src/app/DiscordSettingsOps.cpp
@@ -170,6 +172,7 @@ if(POWERSHELL_EXE)
         tests/automatic_promotion_credit_contract.ps1
         tests/dashboard_completion_window_contract.ps1
         tests/discord_attachment_pending_edit_contract.ps1
+        tests/discord_access_management_contract.ps1
         tests/discord_ticket_priority_contract.ps1
         tests/octo_p0_contract.ps1
         tests/octo_p1_contract.ps1
