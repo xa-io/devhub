@@ -226,8 +226,12 @@ struct ReviewCleanupFailureRow {
 };
 
 struct NotifyFailureCache {
+    bool loaded = false;
+    int databaseChanges = 0;
+    int databaseVersion = 0;
     std::vector<NotifyFailureRow> active;
     std::vector<NotifyFailureRow> dismissed;
+    std::vector<NotifyFailureAlertTarget> acknowledgedTargets;
     int activeTotal = 0;
     int dismissedTotal = 0;
     int oldMessageTotal = 0;
@@ -235,7 +239,10 @@ struct NotifyFailureCache {
     std::vector<OrphanFailureRow> orphans;
     int orphanTotal = 0;
     std::vector<ReviewCleanupFailureRow> reviewCleanups;
+    std::vector<ReviewCleanupFailureTarget> reviewCleanupTargets;
+    std::vector<ReviewCleanupFailureTarget> clearedReviewCleanupTargets;
     int reviewCleanupTotal = 0;
+    int clearedReviewCleanupTotal = 0;
 };
 
 struct App {
@@ -247,6 +254,9 @@ struct App {
     HWND hwnd = nullptr;
     uint16_t apiPort = 0;
     double lastAutoRefresh = 0;
+    bool discordListsLoaded = false;
+    int discordListsDatabaseChanges = 0;
+    int discordListsDatabaseVersion = 0;
 
     // Presentation-only branding. The internal product identity remains
     // DEVHUB_APP_NAME everywhere outside the sidebar and native caption.
@@ -327,6 +337,9 @@ struct App {
     int recreateNotifyCardRevision = -1;
     std::vector<NotifyFailureAlertTarget> dismissOldNotifyAlertTargets;
     int dismissOldNotifyAlertTotal = 0;
+    std::vector<NotifyFailureAlertTarget> clearAcknowledgedNotifyTargets;
+    std::vector<ReviewCleanupFailureTarget> reviewCleanupActionTargets;
+    bool retryReviewCleanupAction = false;
     long long editPendingMessageId = 0;
     int editPendingProject = -1;
     long long editPendingProjectId = 0;

@@ -249,6 +249,89 @@ void drawModals(App& a) {
         ImGui::EndPopup();
     }
 
+    if (!a.clearAcknowledgedNotifyTargets.empty() &&
+        !ImGui::IsPopupOpen("Clear acknowledged failures?"))
+        ImGui::OpenPopup("Clear acknowledged failures?");
+    if (ImGui::BeginPopupModal("Clear acknowledged failures?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        const int confirmedCount = static_cast<int>(
+            a.clearAcknowledgedNotifyTargets.size());
+        ImGui::Text("Clear %d acknowledged failure(s) from delivery history?",
+                    confirmedCount);
+        ImGui::TextWrapped(
+            "This clears all reviewed entries, including those omitted from "
+            "the list. Cards and Discord messages are kept. These failed "
+            "revisions stay quiet; later failures can still raise alerts. "
+            "Entries that changed since opening this confirmation are skipped.");
+        if (ImGui::Button("Clear all acknowledged failures")) {
+            const auto result = clearAcknowledgedNotifyCardAlerts(
+                a.db, a.clearAcknowledgedNotifyTargets);
+            if (result.ok) {
+                toast(a, std::to_string(result.changed) +
+                    " acknowledged failure(s) cleared; " +
+                    std::to_string(confirmedCount - result.changed) +
+                    " skipped (changed or already cleared)");
+            } else {
+                toast(a, "acknowledged failure history was not cleared", true);
+            }
+            a.needNotifyCounters = true;
+            a.clearAcknowledgedNotifyTargets.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            a.clearAcknowledgedNotifyTargets.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (!a.reviewCleanupActionTargets.empty() &&
+        !ImGui::IsPopupOpen("Bulk reaction cleanup?"))
+        ImGui::OpenPopup("Bulk reaction cleanup?");
+    if (ImGui::BeginPopupModal("Bulk reaction cleanup?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        const int confirmedCount = static_cast<int>(
+            a.reviewCleanupActionTargets.size());
+        ImGui::Text("%s %d reaction cleanup failure(s)?",
+            a.retryReviewCleanupAction ? "Retry" : "Clear alerts for",
+            confirmedCount);
+        ImGui::TextWrapped(a.retryReviewCleanupAction
+            ? "Fix the bot's Manage Messages permission in the target channels "
+              "first. This queues removal of every reaction on these exact "
+              "bot messages using the normal cleanup worker. Cards and tickets "
+              "are kept. Changed jobs are skipped."
+            : "This clears the local failure alerts only. Reactions remain in "
+              "Discord, and failed jobs are retained for retry after permissions "
+              "are fixed. Changed jobs are skipped.");
+        if (ImGui::Button(a.retryReviewCleanupAction
+                ? "Queue all retries" : "Clear all cleanup alerts")) {
+            const auto result = a.retryReviewCleanupAction
+                ? retryFailedReviewControlCleanups(
+                    a.db, a.discord, a.reviewCleanupActionTargets)
+                : clearFailedReviewControlCleanupAlerts(
+                    a.db, a.reviewCleanupActionTargets);
+            if (result.ok)
+                toast(a, std::to_string(result.changed) +
+                    (a.retryReviewCleanupAction
+                        ? " reaction cleanup(s) queued; "
+                        : " reaction cleanup alert(s) cleared; ") +
+                    std::to_string(confirmedCount - result.changed) +
+                    " skipped (changed or already handled)");
+            else
+                toast(a, "bulk reaction cleanup action was not applied", true);
+            a.needNotifyCounters = true;
+            a.reviewCleanupActionTargets.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            a.reviewCleanupActionTargets.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
     // Replacing a terminal card can intentionally create a new Discord
     // message. Confirm separately from a same-target delivery retry.
     if (a.recreateNotifyCardId != 0 &&

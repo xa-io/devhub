@@ -4591,6 +4591,43 @@ SELECT m.state,m.content,m.admin_note,m.inferred_project_id,
                   "terminal all-reaction cleanup failures remain visible and operator-retryable");
         }
 
+        {
+            auto lk = db.guard();
+            SQLite::Statement fail(db.raw(lk.token()),
+                "UPDATE discord_review_control_cleanups SET cleanup_state='failed',"
+                "cleanup_attempts=1,cleanup_last_error='Missing Permissions' WHERE id=?");
+            fail.bind(1, retryCleanupId);
+            fail.exec();
+        }
+        const std::vector<ReviewCleanupFailureTarget> cleanupSnapshot{
+            {retryCleanupId, retryCleanupRevision + 1}};
+        auto invalidCleanupSnapshot = cleanupSnapshot;
+        invalidCleanupSnapshot.push_back({0, 0});
+        const auto invalidCleanupClear = clearFailedReviewControlCleanupAlerts(
+            &db, invalidCleanupSnapshot);
+        const auto clearedCleanup = clearFailedReviewControlCleanupAlerts(
+            &db, cleanupSnapshot);
+        const auto staleCleanupRetry = retryFailedReviewControlCleanups(
+            &db, nullptr, cleanupSnapshot);
+        const auto recoveredCleanup = retryFailedReviewControlCleanups(
+            &db, nullptr, {{retryCleanupId, retryCleanupRevision + 2}});
+        {
+            auto lk = db.guard();
+            SQLite::Statement current(db.raw(lk.token()),
+                "SELECT cleanup_state,cleanup_revision,cleanup_last_error "
+                "FROM discord_review_control_cleanups WHERE id=?");
+            current.bind(1, retryCleanupId);
+            requireRow(current, "bulk reaction cleanup fixture retained its job");
+            check(!invalidCleanupClear.ok && clearedCleanup.ok &&
+                      clearedCleanup.changed == 1 && staleCleanupRetry.ok &&
+                      staleCleanupRetry.changed == 0 && recoveredCleanup.ok &&
+                      recoveredCleanup.changed == 1 &&
+                      current.getColumn(0).getString() == "pending" &&
+                      current.getColumn(1).getInt() == retryCleanupRevision + 3 &&
+                      current.getColumn(2).getString().empty(),
+                  "bulk reaction cleanup clear rolls back invalid batches and preserves retryable revision-guarded jobs");
+        }
+
         detectedImage.attachmentId = "123456789012345672";
         detectedImage.sourceChannelId = "123456789012345670";
         detectedImage.sourceMessageId = "123456789012345671";
@@ -5263,6 +5300,38 @@ SELECT COUNT(*) FROM discord_notify_cards n
                           "823456789012345701" &&
                       finalState.getColumn(5).getInt() == 2,
                   "acknowledged failures can be restored and a later failed revision becomes visible without losing lineage");
+        }
+        const std::vector<NotifyFailureAlertTarget> clearHistorySnapshot{
+            {dismissedEditCard, 8, "edit"},
+            {dismissedCreateCard, 4, "create"},
+            {dismissedOldMessageCard, 3, "edit"},
+            {dismissedOldMessageCodeCard, 2, "edit"}};
+        auto invalidHistorySnapshot = clearHistorySnapshot;
+        invalidHistorySnapshot.push_back({0, 0, "invalid"});
+        const auto invalidHistoryClear = clearAcknowledgedNotifyCardAlerts(
+            &db, invalidHistorySnapshot);
+        const auto historyCleared = clearAcknowledgedNotifyCardAlerts(
+            &db, clearHistorySnapshot);
+        const auto historyClearedAgain = clearAcknowledgedNotifyCardAlerts(
+            &db, clearHistorySnapshot);
+        {
+            auto lk = db.guard();
+            SQLite::Statement retained(db.raw(lk.token()),
+                "SELECT edit_state,edit_revision,edit_last_error,notify_message_id,"
+                "(SELECT reason FROM discord_notify_failure_dismissals "
+                " WHERE card_row_id=n.id AND operation='edit' AND revision=8) "
+                "FROM discord_notify_cards n WHERE id=?");
+            retained.bind(1, dismissedEditCard);
+            requireRow(retained, "bulk clear retains canonical failed card");
+            check(!invalidHistoryClear.ok && historyCleared.ok &&
+                      historyCleared.changed == 4 && historyClearedAgain.ok &&
+                      historyClearedAgain.changed == 0 &&
+                      retained.getColumn(0).getString() == "failed" &&
+                      retained.getColumn(1).getInt() == 8 &&
+                      retained.getColumn(2).getString() == "new revision failure" &&
+                      retained.getColumn(3).getString() == "823456789012345701" &&
+                      retained.getColumn(4).getString() == "cleared:operator",
+                  "bulk acknowledged history clear is atomic and idempotent without losing transport or acknowledgement lineage");
             SQLite::Statement cleanup(db.raw(lk.token()),
                 "DELETE FROM discord_notify_cards WHERE id IN (?,?,?,?)");
             cleanup.bind(1, dismissedEditCard);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xa_devhub VERSION 1.0.11 LANGUAGES CXX)
+project(xa_devhub VERSION 1.0.12 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,6 +75,7 @@ add_library(devhub_app STATIC
     src/app/OpsCalendar.cpp
     src/app/OpsDiscordTickets.cpp
     src/app/OpsItems.cpp
+    src/app/OpsNotificationFailures.cpp
     src/app/PacketData.cpp
     src/app/PacketExports.cpp
     src/app/PacketOps.cpp
@@ -201,6 +202,11 @@ if(Python3_FOUND)
                      "${CMAKE_SOURCE_DIR}/tests/test_build_wrapper_pause.py")
     set_tests_properties(build_wrapper_pause
         PROPERTIES LABELS "static;wrapper-contract")
+    add_test(NAME notification_failure_bulk
+             COMMAND Python3::Interpreter
+                     "${CMAKE_SOURCE_DIR}/tests/test_notification_failure_bulk.py")
+    set_tests_properties(notification_failure_bulk
+        PROPERTIES LABELS "static;source-contract")
 endif()
 else()
     message(STATUS "Local-only tests are not included; building XA DevHub without CTest targets")

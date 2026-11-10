@@ -349,6 +349,8 @@ CREATE TABLE IF NOT EXISTS discord_messages (
     item_id INTEGER REFERENCES items(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dmsg_state ON discord_messages(state, kind);
+CREATE INDEX IF NOT EXISTS idx_dmsg_channel_state_kind
+ ON discord_messages(channel_row_id,state,kind);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS activity_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

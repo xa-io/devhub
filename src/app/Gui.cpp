@@ -2667,8 +2667,22 @@ static void refreshFrameCaches(App& a) {
         if (a.page == Page::Work) a.needWork = true;
         if (a.page == Page::Knowledge) a.needKnowledge = true;
         if (a.page == Page::Discord) {
-            a.needInbox = a.needChannels = a.needGuilds = true;
-            a.needNotifyCounters = true;
+            auto lk = a.db->guard();
+            const int changes = a.db->raw(lk.token()).getTotalChanges();
+            SQLite::Statement version(a.db->raw(lk.token()), "PRAGMA data_version");
+            version.executeStep();
+            const int dataVersion = version.getColumn(0).getInt();
+            if (!a.discordListsLoaded ||
+                changes != a.discordListsDatabaseChanges ||
+                dataVersion != a.discordListsDatabaseVersion) {
+                a.needInbox = a.needChannels = a.needGuilds = true;
+                a.needNotifyCounters = true;
+                // Sample before loading: a concurrent commit remains dirty
+                // for the next poll instead of being hidden by a later stamp.
+                a.discordListsDatabaseChanges = changes;
+                a.discordListsDatabaseVersion = dataVersion;
+                a.discordListsLoaded = true;
+            }
         }
     }
     // reloads (deferred while interacting; the need* flags keep them queued)

@@ -335,6 +335,7 @@ bool restoreFailedNotifyCardAlert(Db* db, long long cardRowId,
 struct NotifyFailureAlertTarget {
     long long cardRowId = 0;
     int revision = 0;
+    std::string operation = "edit";
 };
 
 struct NotifyFailureDismissResult {
@@ -350,6 +351,12 @@ inline constexpr std::size_t kMaxNotifyFailureDismissBatch = 200;
 NotifyFailureDismissResult dismissOldMessageNotifyCardAlerts(
     Db* db, const std::vector<NotifyFailureAlertTarget>& targets);
 
+// Clear the operator-confirmed acknowledged-history snapshot locally. Retain
+// acknowledgements (including their original reason) to suppress the same
+// failed revision; newer, active and no-longer-current failures are untouched.
+NotifyFailureDismissResult clearAcknowledgedNotifyCardAlerts(
+    Db* db, const std::vector<NotifyFailureAlertTarget>& targets);
+
 // Requeue a terminal exact callback-generated orphan cleanup. Successful
 // cleanup (including Discord 404/already absent) removes the queue row; stale
 // failures cannot overwrite a newer operator retry generation.
@@ -360,6 +367,20 @@ bool retryFailedNotifyOrphan(Db* db, DiscordBot* bot, long long orphanRowId);
 // delivery failures.
 bool retryFailedReviewControlCleanup(Db* db, DiscordBot* bot,
                                      long long cleanupRowId);
+
+struct ReviewCleanupFailureTarget {
+    long long rowId = 0;
+    int revision = 0;
+};
+
+// Exact confirmed failed generations only. Clear hides local alerts while
+// retaining the failed outbox/error; retry starts new generations and wakes
+// the outbox once. Neither action includes jobs arriving after confirmation.
+NotifyFailureDismissResult clearFailedReviewControlCleanupAlerts(
+    Db* db, const std::vector<ReviewCleanupFailureTarget>& targets);
+NotifyFailureDismissResult retryFailedReviewControlCleanups(
+    Db* db, DiscordBot* bot,
+    const std::vector<ReviewCleanupFailureTarget>& targets);
 
 // Idempotently stage one exact terminal card for all-reaction cleanup.
 // Re-staging an in-flight target advances its generation so an older callback

@@ -718,7 +718,23 @@ void drawDiscord(App& a) {
             }
         }
 
-        const bool reloadNotifyCounters = a.needNotifyCounters;
+        bool reloadNotifyCounters = a.needNotifyCounters;
+        int notifyDatabaseChanges = 0;
+        int notifyDatabaseVersion = 0;
+        if (reloadNotifyCounters) {
+            auto lk = a.db->guard();
+            // The bot/API share this connection: data_version alone would
+            // miss their writes. total_changes is an in-memory counter;
+            // data_version additionally catches commits on other connections.
+            notifyDatabaseChanges = a.db->raw(lk.token()).getTotalChanges();
+            SQLite::Statement version(a.db->raw(lk.token()), "PRAGMA data_version");
+            version.executeStep();
+            notifyDatabaseVersion = version.getColumn(0).getInt();
+            reloadNotifyCounters = !a.notifyFailures.loaded ||
+                notifyDatabaseChanges != a.notifyFailures.databaseChanges ||
+                notifyDatabaseVersion != a.notifyFailures.databaseVersion;
+            if (!reloadNotifyCounters) a.needNotifyCounters = false;
+        }
         if (reloadNotifyCounters) {
             a.notifyFailures = {};
             auto lk = a.db->guard();
@@ -750,10 +766,30 @@ SELECT COUNT(*) FROM failures f
  WHERE EXISTS(
    SELECT 1 FROM discord_notify_failure_dismissals d
     WHERE d.card_row_id=f.id AND d.operation=f.operation
-      AND d.revision=f.revision))sql");
+      AND d.revision=f.revision
+      AND d.reason NOT LIKE 'cleared:%'))sql");
             dismissedTotal.executeStep();
             a.notifyFailures.dismissedTotal =
                 dismissedTotal.getColumn(0).getInt();
+
+            // Snapshot every acknowledged current failure, not just the 20
+            // displayed below. Confirmation retains these exact identities.
+            SQLite::Statement acknowledgedTargets(a.db->raw(lk.token()), R"sql(
+SELECT d.card_row_id,d.revision,d.operation
+  FROM discord_notify_failure_dismissals d
+  JOIN discord_notify_cards n ON n.id=d.card_row_id
+ WHERE d.reason NOT LIKE 'cleared:%'
+   AND ((d.operation='create' AND n.post_state='failed'
+         AND n.post_revision=d.revision)
+     OR (d.operation='edit' AND n.edit_state='failed'
+         AND n.edit_revision=d.revision))
+ ORDER BY d.card_row_id,d.operation)sql");
+            while (acknowledgedTargets.executeStep()) {
+                a.notifyFailures.acknowledgedTargets.push_back({
+                    acknowledgedTargets.getColumn(0).getInt64(),
+                    acknowledgedTargets.getColumn(1).getInt(),
+                    acknowledgedTargets.getColumn(2).getString()});
+            }
 
             SQLite::Statement oldMessageTotal(a.db->raw(lk.token()), R"sql(
 SELECT COUNT(*) FROM discord_notify_cards n
@@ -852,7 +888,8 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
  WHERE EXISTS(
    SELECT 1 FROM discord_notify_failure_dismissals d
     WHERE d.card_row_id=f.id AND d.operation=f.operation
-      AND d.revision=f.revision)
+      AND d.revision=f.revision
+      AND d.reason NOT LIKE 'cleared:%')
  ORDER BY updated_at DESC,id DESC,operation LIMIT 20)sql");
             readFailureRows(dismissed, a.notifyFailures.dismissed);
         }
@@ -968,6 +1005,13 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
                 ImGui::TextColored(C_DIM,
                     "These failed revisions remain recorded but no longer "
                     "raise an alert. Restore one to make it active again.");
+                const std::string clearLabel =
+                    "clear all acknowledged failures (" +
+                    std::to_string(a.notifyFailures.acknowledgedTargets.size()) +
+                    ")";
+                if (ImGui::SmallButton(clearLabel.c_str()))
+                    a.clearAcknowledgedNotifyTargets =
+                        a.notifyFailures.acknowledgedTargets;
                 for (const NotifyFailureRow& row :
                      dismissedNotifyFailures) {
                     ImGui::PushID(static_cast<int>(row.id));
@@ -1091,15 +1135,32 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
             auto lk = a.db->guard();
             SQLite::Statement total(a.db->raw(lk.token()),
                 "SELECT COUNT(*) FROM discord_review_control_cleanups "
-                "WHERE cleanup_state='failed'");
+                "WHERE cleanup_state='failed' "
+                "AND cleanup_last_error NOT LIKE 'cleared:%'");
             total.executeStep();
             a.notifyFailures.reviewCleanupTotal =
                 total.getColumn(0).getInt();
+            SQLite::Statement reviewCleanupTargets(a.db->raw(lk.token()), R"sql(
+SELECT id,cleanup_revision,cleanup_last_error LIKE 'cleared:%'
+  FROM discord_review_control_cleanups
+ WHERE cleanup_state='failed' ORDER BY id)sql");
+            while (reviewCleanupTargets.executeStep()) {
+                const ReviewCleanupFailureTarget target{
+                    reviewCleanupTargets.getColumn(0).getInt64(),
+                    reviewCleanupTargets.getColumn(1).getInt()};
+                if (reviewCleanupTargets.getColumn(2).getInt() != 0)
+                    a.notifyFailures.clearedReviewCleanupTargets.push_back(target);
+                else
+                    a.notifyFailures.reviewCleanupTargets.push_back(target);
+            }
+            a.notifyFailures.clearedReviewCleanupTotal = static_cast<int>(
+                a.notifyFailures.clearedReviewCleanupTargets.size());
             SQLite::Statement failed(a.db->raw(lk.token()),
                 "SELECT id,card_row_id,notify_channel_id,notify_message_id,"
                 "cleanup_attempts,cleanup_last_error "
                 "FROM discord_review_control_cleanups "
                 "WHERE cleanup_state='failed' "
+                "AND cleanup_last_error NOT LIKE 'cleared:%' "
                 "ORDER BY updated_at DESC,id DESC LIMIT 20");
             while (failed.executeStep()) {
                 ReviewCleanupFailureRow row;
@@ -1111,6 +1172,12 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
                 row.error = redactHttpUrls(failed.getColumn(5).getString());
                 a.notifyFailures.reviewCleanups.push_back(std::move(row));
             }
+            // Store the stamp taken BEFORE reading the cache. A write between
+            // cache sections must trigger the next refresh rather than being
+            // mistaken for data already included in this snapshot.
+            a.notifyFailures.databaseChanges = notifyDatabaseChanges;
+            a.notifyFailures.databaseVersion = notifyDatabaseVersion;
+            a.notifyFailures.loaded = true;
             a.needNotifyCounters = false;
         }
         const auto& reviewCleanupFailures =
@@ -1126,7 +1193,22 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
                 "Every reaction on the exact terminal bot card is targeted; "
                 "the card, source, and item are retained. Requires Manage "
                 "Messages.");
+            ImGui::TextWrapped(
+                "For Missing Permissions, allow the bot Manage Messages in the "
+                "target channel and check category/channel overrides, then "
+                "retry. Clearing only hides local alerts; reactions remain.");
             ImGui::PushID("review_control_cleanup");
+            if (ImGui::SmallButton("retry all reaction cleanups")) {
+                a.reviewCleanupActionTargets =
+                    a.notifyFailures.reviewCleanupTargets;
+                a.retryReviewCleanupAction = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("clear all reaction cleanup alerts")) {
+                a.reviewCleanupActionTargets =
+                    a.notifyFailures.reviewCleanupTargets;
+                a.retryReviewCleanupAction = false;
+            }
             for (const ReviewCleanupFailureRow& row :
                  reviewCleanupFailures) {
                 ImGui::PushID(static_cast<int>(row.id));
@@ -1158,6 +1240,16 @@ SELECT id,item_id,message_row_id,operation,attempts,revision,error,
                     "%d older reaction cleanup failure(s) omitted",
                     reviewCleanupFailureTotal -
                     static_cast<int>(reviewCleanupFailures.size()));
+        }
+        if (a.notifyFailures.clearedReviewCleanupTotal > 0) {
+            ImGui::TextColored(C_DIM,
+                "%d reaction cleanup alert(s) cleared locally; reactions may remain",
+                a.notifyFailures.clearedReviewCleanupTotal);
+            if (ImGui::SmallButton("retry cleared reaction cleanups")) {
+                a.reviewCleanupActionTargets =
+                    a.notifyFailures.clearedReviewCleanupTargets;
+                a.retryReviewCleanupAction = true;
+            }
         }
     }
 
