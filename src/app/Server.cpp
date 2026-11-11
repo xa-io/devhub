@@ -1,6 +1,8 @@
 #include "Server.h"
 #include "BuildRunner.h"
 #include "Db.h"
+#include "DiscordAccess.h"
+#include "DiscordBot.h"
 #include "Gui.h"
 #include "KnowledgeOps.h"
 #include "Ops.h"
@@ -26,6 +28,8 @@
 #include <ctime>
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -408,9 +412,9 @@ static bool apiWritableSettingKey(const std::string& key) {
         "stale_days", "release_draft_days", "backup_retention",
         "dashboard_completed_days", "show_log_panel",
         "leaderboard_excluded_source_ids", "app_display_name",
-        // Detector automation remains supported, but only through the exact
-        // parser used by runtime ingest. Identity and Discord routing settings
-        // remain native-UI only.
+        "release_announcement_channel_id",
+        // Bot identity and ticket routing belong to the native UI.
+        // Detector automation uses the exact runtime ingest parser.
         "detection_patterns"
     };
     if (writable.find(key) != writable.end()) return true;
@@ -448,6 +452,20 @@ static bool normalizeSettingValue(const std::string& key, const json& value,
     if (normalized == "[redacted]") {
         error = "the [redacted] sentinel cannot be written";
         return false;
+    }
+
+    if (key == "release_announcement_channel_id") {
+        if (!value.is_string()) {
+            error = "release_announcement_channel_id must be a string";
+            return false;
+        }
+        normalized = trim(normalized);
+        std::uint64_t parsed = 0;
+        if (!normalized.empty() && !parseDiscordAccessSnowflake(normalized, parsed)) {
+            error = "release_announcement_channel_id must be blank or a nonzero uint64 channel id";
+            return false;
+        }
+        return true;
     }
 
     if (key == "stale_days" || key == "release_draft_days") {
@@ -1650,6 +1668,109 @@ FROM projects p ORDER BY p.archived, p.sort_order, p.name COLLATE NOCASE)sql");
                             {"bugs_found", bugs},
                             {"images_staged", imagesStaged},
                             {"skipped_disabled", skippedDisabled}});
+    });
+
+    CROW_ROUTE(app, "/api/releases/announce").methods("POST"_method)(
+        [this](const crow::request& req) {
+        json body; crow::response rejected;
+        if (!jsonRequest(req, body, rejected)) {
+            json result = json::parse(rejected.body, nullptr, false);
+            if (!result.is_object()) result = json{{"ok", false}};
+            result["status"] = "not_sent";
+            return jsonRes(result, rejected.code);
+        }
+        static constexpr std::array<const char*, 6> fields{
+            "audience", "channel_id", "product", "version", "release_url", "notes"
+        };
+        if (body.size() != fields.size() ||
+            !std::all_of(fields.begin(), fields.end(), [&body](const char* key) {
+                return body.contains(key) && body[key].is_string();
+            })) {
+            return jsonRes(json{
+                {"ok", false}, {"status", "not_sent"},
+                {"error", "expected only six string fields: audience, channel_id, product, version, release_url, notes"}
+            }, 400);
+        }
+        PublicReleaseAnnouncement announcement{
+            body["audience"].get<std::string>(),
+            body["channel_id"].get<std::string>(),
+            body["product"].get<std::string>(),
+            body["version"].get<std::string>(),
+            body["release_url"].get<std::string>(),
+            body["notes"].get<std::string>()
+        };
+        NotifyCard card;
+        std::string error;
+        if (!preparePublicReleaseCard(announcement, card, error))
+            return jsonRes(json{{"ok", false}, {"status", "not_sent"},
+                                {"error", error}}, 400);
+        const std::string channelId = trim(announcement.channelId);
+        json result{
+            {"ok", false}, {"status", "not_sent"}, {"channel_id", channelId},
+            {"product", trim(announcement.product)},
+            {"version", trim(announcement.version)}, {"release_url", card.url}
+        };
+        if (bot == nullptr) {
+            result["error"] = "Discord bot is unavailable";
+            return jsonRes(result);
+        }
+
+        struct Receipt {
+            std::mutex mutex;
+            std::condition_variable ready;
+            bool complete = false;
+            std::string status, messageId, error;
+        };
+        auto receipt = std::make_shared<Receipt>();
+        const auto finish = [receipt](const std::string& status,
+                                      const std::string& messageId,
+                                      const std::string& detail) {
+            {
+                std::lock_guard<std::mutex> lock(receipt->mutex);
+                if (receipt->complete) return;
+                receipt->status = status;
+                receipt->messageId = messageId;
+                receipt->error = detail;
+                receipt->complete = true;
+            }
+            receipt->ready.notify_one();
+        };
+        bot->postCard(channelId, card,
+            [finish](const std::string& messageId) {
+                uint64_t parsedId = 0;
+                const auto parsed = std::from_chars(
+                    messageId.data(), messageId.data() + messageId.size(),
+                    parsedId);
+                if (messageId.empty() || messageId.size() > 20 ||
+                    !std::all_of(messageId.begin(), messageId.end(),
+                                 [](char ch) { return ch >= '0' && ch <= '9'; }) ||
+                    parsed.ec != std::errc() ||
+                    parsed.ptr != messageId.data() + messageId.size() ||
+                    parsedId == 0) {
+                    finish("unknown", "", "Discord returned an invalid message-ID receipt");
+                    return;
+                }
+                finish("posted", messageId, "");
+            },
+            nullptr,
+            [finish](const std::string& detail, CardPostFailure outcome) {
+                finish(outcome == CardPostFailure::NotSent ? "not_sent" : "unknown",
+                       "", detail);
+            });
+        std::unique_lock<std::mutex> lock(receipt->mutex);
+        if (!receipt->ready.wait_for(lock, std::chrono::seconds(10),
+                                    [&receipt] { return receipt->complete; })) {
+            result["status"] = "unknown";
+            result["error"] = "Discord submission did not return a receipt within 10 seconds";
+            return jsonRes(result);
+        }
+        result["status"] = receipt->status;
+        result["ok"] = receipt->status == "posted";
+        if (receipt->status == "posted")
+            result["message_id"] = receipt->messageId;
+        else
+            result["error"] = receipt->error;
+        return jsonRes(result);
     });
 
     // ---- AI review bundle export ----

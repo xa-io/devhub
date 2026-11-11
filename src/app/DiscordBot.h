@@ -30,7 +30,21 @@ struct NotifyCard {
     std::string title, description, url, footer;
     uint32_t color = 0x4f8ff7;
     std::vector<std::pair<std::string, std::string>> fields; // name -> value
+    bool publicRelease = false;
 };
+
+struct PublicReleaseAnnouncement {
+    std::string audience, channelId, product, version, releaseUrl, notes;
+};
+
+// Render the exact description used by the embed and its payload validation.
+std::string discordCardDescription(const NotifyCard& card);
+
+// Validate the outbound public payload and its transmitted Discord embed limits.
+bool preparePublicReleaseCard(const PublicReleaseAnnouncement& announcement,
+                              NotifyCard& card, std::string& error);
+
+enum class CardPostFailure { NotSent, Unknown };
 
 // Embedded Discord gateway client (D++). Connects with the token saved on
 // the Discord settings page, discovers text channels of monitored guilds when
@@ -65,7 +79,10 @@ public:
     void postCard(const std::string& channelId, const NotifyCard& card,
                   std::function<void(const std::string& messageId)> onPosted,
                   std::function<void(const std::string& error,
-                                     bool retryable)> onFailed = nullptr);
+                                     bool retryable)> onFailed = nullptr,
+                  std::function<void(const std::string& error,
+                                     CardPostFailure outcome)>
+                      onClassifiedFailure = nullptr);
     void editCard(const std::string& channelId, const std::string& messageId,
                   const NotifyCard& card,
                   std::function<void()> onEdited = nullptr,

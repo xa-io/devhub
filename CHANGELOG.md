@@ -2,6 +2,14 @@
 
 XA DevHub changes are listed newest first.
 
+## Unreleased
+
+- Check stable public plugin releases every 30 minutes, using their public manifest download links and matching public changelog entries. The first observation establishes a baseline.
+- Remember successful and uncertain announcement attempts across restarts to prevent duplicate posts, and allow definitive rejected sends at a later scheduled check. Configure the release channel on the existing Discord page.
+- Add authenticated public release announcements through the existing Discord bot and PowerShell control command, with validated channel IDs, bounded summaries and HTTPS release links.
+- Require a Discord message-ID receipt before reporting an announcement as posted. Report definitive failures and uncertain transport outcomes from each submission attempt.
+- Disable mentions in public release announcements.
+
 ## v1.0.12
 
 - Added a confirmed clear-all action for acknowledged Discord delivery failures, including entries beyond the displayed list.

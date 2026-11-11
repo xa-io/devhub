@@ -217,7 +217,7 @@ bool isPublicSettingKey(const std::string& key) {
         "dashboard_completed_days", "show_log_panel", "ui_project_item_sort",
         "last_auto_maintenance", "leaderboard_excluded_source_ids",
         "app_display_name", "detection_patterns", "notify_guild_id",
-        "notify_channel_id"
+        "notify_channel_id", "release_announcement_channel_id"
     };
     return publicKeys.find(key) != publicKeys.end() ||
            (key.size() > 7 && key.size() <= 64 &&
