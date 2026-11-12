@@ -278,6 +278,93 @@ int devhub::runAppSelftest(std::string_view domain) {
             ++failures;
         }
     };
+    if (runAll || domain == "server" || runPortable) {
+        section("public release announcement validation", [&] {
+            const PublicReleaseAnnouncement valid{
+                "public", "123456789012345678", "ExamplePlugin", "1.2.3.4",
+                "https://example.invalid/releases/tag/v1.2.3.4",
+                "Improved encounter guidance."
+            };
+            NotifyCard card;
+            std::string error;
+            check(preparePublicReleaseCard(valid, card, error) &&
+                      card.publicRelease && card.title == "ExamplePlugin 1.2.3.4" &&
+                      card.description == valid.notes && card.url == valid.releaseUrl &&
+                      card.fields.empty(),
+                  "public release prepares only its approved summary and HTTPS title link");
+            auto rejected = [&](const PublicReleaseAnnouncement& value, const char* label) {
+                check(!preparePublicReleaseCard(value, card, error) && !error.empty(),
+                      label);
+            };
+            for (const std::string audience : {"private", "hehe", "Public"}) {
+                auto value = valid;
+                value.audience = audience;
+                rejected(value, "release announcement requires exact public audience");
+            }
+            for (const std::string channel :
+                 {"", "0", "-1", "+1", "12x", "18446744073709551616"}) {
+                auto value = valid;
+                value.channelId = channel;
+                rejected(value, "release destination rejects zero, nondecimal and uint64 overflow");
+            }
+            auto value = valid;
+            value.channelId = "18446744073709551615";
+            check(preparePublicReleaseCard(value, card, error),
+                  "release destination accepts the uint64 boundary without signed conversion");
+            for (const std::string url : {
+                     "http://example.invalid/release",
+                     "https://user:password@example.invalid/release",
+                     "https://", "https://example.invalid/a\nb",
+                     "https://example.invalid\\release"}) {
+                value = valid;
+                value.releaseUrl = url;
+                rejected(value, "release link requires a valid credential-free HTTPS URL");
+            }
+            value = valid;
+            value.releaseUrl = "https://example.invalid/" + std::string(1024, 'a');
+            rejected(value, "release URL has a bounded byte length");
+            value = valid;
+            value.product = "Example\nPlugin";
+            rejected(value, "release product rejects line and control injection");
+            value = valid;
+            value.product = std::string(129, 'a');
+            rejected(value, "release product has a bounded byte length");
+            value = valid;
+            value.version = std::string(65, 'a');
+            rejected(value, "release version has a bounded byte length");
+            value = valid;
+            value.product = std::string(128, '*');
+            value.version = std::string(64, '*');
+            rejected(value, "release title limit applies after Markdown escaping");
+            value = valid;
+            value.notes = " \r\n\t ";
+            rejected(value, "release notes require nonblank public text");
+            value = valid;
+            value.notes = std::string(4097, 'a');
+            rejected(value, "release notes reject an oversized body");
+            value = valid;
+            value.notes = "- **Fixed** Encounter guidance now follows `/gmc`.\n"
+                          "- **Improved** Current-target recovery.";
+            check(preparePublicReleaseCard(value, card, error) &&
+                      discordCardDescription(card) == value.notes,
+                  "public embed description preserves curated bold bullets and command backticks");
+            NotifyCard ticket;
+            ticket.description = value.notes;
+            check(discordCardDescription(ticket) ==
+                      escapeDiscordMarkdown(value.notes),
+                  "existing ticket embed descriptions retain Markdown escaping");
+            value = valid;
+            value.notes = std::string(4096, '*');
+            check(preparePublicReleaseCard(value, card, error) &&
+                      discordCardDescription(card) == value.notes &&
+                      discordCardDescription(card).size() == 4096,
+                  "public embed description accepts its actual 4096-byte Markdown boundary");
+            value = valid;
+            value.notes = std::string("before\0after", 12);
+            rejected(value, "release notes reject embedded control characters");
+        });
+    }
+
     auto packetField = [](const std::string& packet, const std::string& label) {
         const std::string marker = "- " + label + ": ";
         const size_t begin = packet.find(marker);
@@ -353,6 +440,223 @@ int devhub::runAppSelftest(std::string_view domain) {
         return 1;
     }
     std::string dbPath = (testDir / "devhub.db").string();
+    if (runAll || domain == "server" || runPortable) section("Public release monitor", [&] {
+        using json = nlohmann::json;
+        const json manifest = {
+            {"InternalName", "ExamplePlugin"}, {"Name", "Example Plugin"},
+            {"AssemblyVersion", "1.2.3.4"},
+            {"DownloadLinkUpdate", "https://github.com/Example/Public/releases/download/v1.2.3.4/latest.zip"}
+        };
+        PublicPluginRelease selected;
+        check(selectPublicPluginRelease(json::array({manifest}).dump(), "ExamplePlugin",
+                  "Local name", "https://github.com/Example/Private", selected) &&
+                  selected.repository == "example/public" && selected.tag == "v1.2.3.4" &&
+                  selected.plugin == "ExamplePlugin" && selected.product == "Example Plugin",
+              "public download metadata takes precedence over the private source repository");
+        check(!selectPublicPluginRelease(json::array({manifest, manifest}).dump(),
+                  "ExamplePlugin", "", "", selected),
+              "ambiguous plugin manifest rows cannot select a release");
+        check(!selectPublicPluginRelease(json::array({manifest}).dump(), "Missing", "", "", selected) &&
+                  !selectPublicPluginRelease(json::array({manifest}).dump(), "", "", "", selected),
+              "manifest arrays require an exact unambiguous plugin key");
+        auto changed = manifest;
+        changed.erase("AssemblyVersion");
+        changed["TestingAssemblyVersion"] = "1.2.3.4";
+        check(!selectPublicPluginRelease(changed.dump(), "ExamplePlugin", "", "", selected),
+              "testing-only versions cannot become public announcements");
+        changed = manifest;
+        changed["IsTestingExclusive"] = true;
+        check(!selectPublicPluginRelease(changed.dump(), "ExamplePlugin", "", "", selected),
+              "testing-exclusive manifests are excluded");
+        changed = manifest;
+        changed["DownloadLinkUpdate"] = "https://github.com/Example/Public/releases/download/v1.2.3.5/latest.zip";
+        check(!selectPublicPluginRelease(changed.dump(), "ExamplePlugin", "",
+                  "https://github.com/Example/Other", selected),
+              "download tag and stable manifest version must agree");
+        changed["DownloadLinkUpdate"] = "https://github.com/Example/Public/releases/download/latest/latest.zip";
+        check(!selectPublicPluginRelease(changed.dump(), "ExamplePlugin", "",
+                  "https://github.com/Example/Other", selected),
+              "invalid GitHub download routes cannot silently choose another repository");
+        changed = manifest;
+        changed.erase("DownloadLinkUpdate");
+        check(selectPublicPluginRelease(changed.dump(), "ExamplePlugin", "",
+                  "https://github.com/Example/Public", selected) && selected.tag.empty(),
+              "project GitHub metadata can nominate a repository for later public verification");
+        check(!selectPublicPluginRelease(changed.dump(), "ExamplePlugin", "",
+                  "https://example.invalid/Example/Public", selected),
+              "repository fallback requires a literal credential-free GitHub HTTPS route");
+        selectPublicPluginRelease(manifest.dump(), "ExamplePlugin", "", "", selected);
+        const PublicPluginRelease source = selected;
+        const json repository = {
+            {"private", false}, {"html_url", "https://github.com/Example/Public"},
+            {"default_branch", "main"}
+        };
+        const json published = {
+            {"draft", false}, {"prerelease", false}, {"tag_name", "v1.2.3.4"},
+            {"published_at", "2026-01-01T00:00:00Z"},
+            {"html_url", "https://github.com/Example/Public/releases/tag/v1.2.3.4"},
+            {"body", "Public build available."}
+        };
+        const std::string canonical = "# Changelog\n\n## Unreleased\nFuture work\n\n"
+            "## v1.2.3.4\n\n- **Fixed** `/example` targeting.\n\n"
+            "## v1.2.3.3\n- Older changes.\n";
+        check(qualifyPublicPluginRelease(selected, repository.dump(), published.dump(), canonical) &&
+                  selected.notes == "- **Fixed** `/example` targeting.",
+              "exact canonical version section wins over generic release boilerplate");
+        check(qualifyPublicPluginRelease(selected, repository.dump(), published.dump(),
+                  "## v1.2.3.3\n- Previous release.\n", true) && selected.notes.empty(),
+              "an existing changelog without the current version holds posting");
+        check(qualifyPublicPluginRelease(selected, repository.dump(), published.dump(), "", true) &&
+                  selected.notes.empty(),
+              "an existing empty canonical changelog cannot fall through to boilerplate");
+        changed = published;
+        changed["body"] = "- Improved public target recovery.";
+        check(qualifyPublicPluginRelease(selected, repository.dump(), changed.dump(), "") &&
+                  selected.notes == "- Improved public target recovery.",
+              "actual matching release notes are available when canonical files are absent");
+        auto privateRepository = repository;
+        privateRepository["private"] = true;
+        check(!qualifyPublicPluginRelease(selected, privateRepository.dump(), published.dump(), canonical),
+              "private repository metadata cannot qualify a public announcement");
+        for (const char* field : {"draft", "prerelease"}) {
+            changed = published;
+            changed[field] = true;
+            check(!qualifyPublicPluginRelease(selected, repository.dump(), changed.dump(), canonical),
+                  "draft and prerelease GitHub releases are excluded");
+        }
+        changed = published;
+        changed["html_url"] = "https://github.com/Example/Other/releases/tag/v1.2.3.4";
+        check(!qualifyPublicPluginRelease(selected, repository.dump(), changed.dump(), canonical),
+              "release links must stay in the verified public repository");
+        changed = published;
+        changed["tag_name"] = "v1.2.3.5";
+        check(!qualifyPublicPluginRelease(selected, repository.dump(), changed.dump(), canonical),
+              "unrelated release versions cannot supply announcement notes");
+        check(!qualifyPublicPluginRelease(selected, repository.dump(),
+                  json::array({published, published}).dump(), canonical),
+              "multiple matching public releases are ambiguous");
+        selected = source;
+        check(qualifyPublicPluginRelease(selected, repository.dump(), published.dump(),
+                  "## [1.2.3.4] - 2026-01-01\n- Bracketed entry.\n\n## 1.2.3.3\nOlder.\n") &&
+                  selected.notes == "- Bracketed entry.",
+              "bracketed changelog headings preserve their exact version boundary");
+        check(qualifyPublicPluginRelease(selected, repository.dump(), published.dump(),
+                  "Version 1.2.3.4\n- Plain text entry.\n\nv1.2.3.3\nOlder.\n") &&
+                  selected.notes == "- Plain text entry.",
+              "plain-text changelog version headings retain only their matching entry");
+        check(qualifyPublicPluginRelease(selected, repository.dump(), published.dump(),
+                  "2026-01-02 - 1.2.3.4 - Shared UI update\n\n"
+                  "- **Fixed** Compact controls.\n- Updated UI library.\n\n"
+                  "2026-01-01 - 1.2.3.3 - Previous update\n- Older entry.\n") &&
+                  selected.notes == "- **Fixed** Compact controls.\n- Updated UI library.",
+              "dated version headings select substantive bullets and stop at the next dated entry");
+
+        const auto startup = std::chrono::steady_clock::time_point{};
+        auto nextPoll = startup;
+        check(beginPublicReleasePoll(startup, nextPoll) &&
+                  nextPoll == startup + std::chrono::minutes(30),
+              "startup begins one scheduled announcement pass");
+        check(!beginPublicReleasePoll(startup + std::chrono::minutes(5), nextPoll) &&
+                  !beginPublicReleasePoll(startup + std::chrono::minutes(29), nextPoll) &&
+                  nextPoll == startup + std::chrono::minutes(30),
+              "manual refresh times preserve the next automatic deadline");
+        check(beginPublicReleasePoll(startup + std::chrono::minutes(30), nextPoll) &&
+                  nextPoll == startup + std::chrono::minutes(60),
+              "the normal thirty-minute deadline advances only for its scheduled pass");
+
+        const std::string statePath = (testDir / "public-release-monitor.db").string();
+        PublicPluginRelease release = source;
+        {
+            Db fixture(statePath);
+            check(shouldCheckPublicPluginRelease(&fixture, release),
+                  "an unseen public plugin needs qualification before establishing its baseline");
+            check(!claimPublicPluginRelease(&fixture, release, true),
+                  "first public observation establishes a durable baseline without sending");
+            check(!shouldCheckPublicPluginRelease(&fixture, release),
+                  "unchanged baseline versions skip GitHub metadata and changelog work");
+            release.version = "v1.2.3.4";
+            check(!claimPublicPluginRelease(&fixture, release, true),
+                  "equivalent numeric version spelling cannot post the baseline");
+            release.version = "1.2.3.5";
+            check(shouldCheckPublicPluginRelease(&fixture, release) &&
+                      !claimPublicPluginRelease(&fixture, release, false) &&
+                      shouldCheckPublicPluginRelease(&fixture, release) &&
+                      claimPublicPluginRelease(&fixture, release, true) &&
+                      !claimPublicPluginRelease(&fixture, release, true),
+                  "a newly ready version is claimed once before any outbound submission");
+        }
+        {
+            Db reopened(statePath);
+            check(!shouldCheckPublicPluginRelease(&reopened, release) &&
+                      !claimPublicPluginRelease(&reopened, release, true),
+                  "restart after an in-flight claim preserves unknown outcome and suppresses resend");
+            recordPublicPluginReleaseReceipt(&reopened, release, "not_sent", "");
+            check(shouldCheckPublicPluginRelease(&reopened, release) &&
+                      claimPublicPluginRelease(&reopened, release, true),
+                  "a definitive not_sent remains eligible on a later polling pass");
+            recordPublicPluginReleaseReceipt(&reopened, release, "posted", "123456789012345678");
+            check(!shouldCheckPublicPluginRelease(&reopened, release) &&
+                      !claimPublicPluginRelease(&reopened, release, true),
+                  "confirmed posted version cannot be submitted again");
+            release.version = "1.2.3.6";
+            check(claimPublicPluginRelease(&reopened, release, true),
+                  "the next numeric increase remains eligible");
+            recordPublicPluginReleaseReceipt(&reopened, release, "posted", "0");
+            check(!claimPublicPluginRelease(&reopened, release, true),
+                  "an invalid posted receipt remains unknown and suppresses blind resend");
+            release.version = "1.2.3.5";
+            check(!shouldCheckPublicPluginRelease(&reopened, release) &&
+                      !claimPublicPluginRelease(&reopened, release, true),
+                  "published version downgrades cannot replay older releases");
+            release.version = "1.2.3.8";
+            check(!claimPublicPluginRelease(&reopened, release, false) &&
+                      shouldCheckPublicPluginRelease(&reopened, release),
+                  "a newer observed version waits while its notes or destination are unavailable");
+            release.version = "1.2.3.7";
+            check(!shouldCheckPublicPluginRelease(&reopened, release) &&
+                      !claimPublicPluginRelease(&reopened, release, true),
+                  "downgrades below an observed but unannounced version are suppressed");
+            release.version = "1.2.3.8";
+            check(claimPublicPluginRelease(&reopened, release, true),
+                  "the same observed version can post once matching notes become ready");
+            recordPublicPluginReleaseReceipt(&reopened, release, "unknown", "");
+            release.repository = "example/replacement";
+            check(!claimPublicPluginRelease(&reopened, release, true),
+                  "a changed public repository establishes its own baseline");
+            release.repository = source.repository;
+            release.version = "1.2.3.9";
+            int claims = 0;
+            std::mutex claimsMutex;
+            const auto claim = [&]() {
+                if (claimPublicPluginRelease(&reopened, release, true)) {
+                    std::lock_guard<std::mutex> lock(claimsMutex);
+                    ++claims;
+                }
+            };
+            std::thread first(claim), second(claim);
+            first.join();
+            second.join();
+            check(claims == 1, "concurrent observations share one durable submission claim");
+            {
+                auto guard = reopened.guard();
+                const std::string key = "release_announcement_state/" +
+                    release.repository + "/" + release.plugin;
+                reopened.setSetting(guard.token(), key, "malformed saved value");
+            }
+            release.version = "1.2.3.10";
+            check(!shouldCheckPublicPluginRelease(&reopened, release) &&
+                      !claimPublicPluginRelease(&reopened, release, true),
+                  "malformed saved state is preserved without sending");
+            VersionChecker checker(&reopened);
+            checker.startAnnouncements(nullptr);
+            checker.refreshAsync();
+            checker.refreshAsync();
+            checker.stop();
+            checker.refreshAsync();
+            check(!checker.busy(),
+                  "queued manual refresh and periodic wait stop safely and cannot restart after stop");
+        }
+    });
     if (runAll || domain == "discord") section("Delete Discord-linked tickets", [&] {
         Db fixture((testDir / "delete-tickets.db").string());
         {
@@ -3146,6 +3450,53 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
                       wrongTokenResponse.status == 401,
                   "API routes reject missing and incorrect per-run tokens");
 
+            const nlohmann::json publicRelease = {
+                {"audience", "public"}, {"channel_id", "123456789012345678"},
+                {"product", "ExamplePlugin"}, {"version", "1.2.3.4"},
+                {"release_url", "https://example.invalid/releases/tag/v1.2.3.4"},
+                {"notes", "Improved encounter guidance."}
+            };
+            const auto offlineAnnouncement = selftestPostJson(
+                startedPort, "/api/releases/announce", publicRelease.dump(), apiToken);
+            const auto offlineReceipt = nlohmann::json::parse(
+                offlineAnnouncement.body, nullptr, false);
+            check(offlineAnnouncement.status == 200 && offlineReceipt.is_object() &&
+                      !offlineReceipt.value("ok", true) &&
+                      offlineReceipt.value("status", "") == "not_sent" &&
+                      offlineReceipt.value("channel_id", "") == "123456789012345678" &&
+                      !offlineReceipt.contains("message_id"),
+                  "release API reports not_sent without a Discord bot or invented receipt");
+            for (const std::string audience : {"private", "hehe", "Public"}) {
+                auto payload = publicRelease;
+                payload["audience"] = audience;
+                const auto response = selftestPostJson(
+                    startedPort, "/api/releases/announce", payload.dump(), apiToken);
+                const auto receipt = nlohmann::json::parse(response.body, nullptr, false);
+                check(response.status == 400 && receipt.is_object() &&
+                          receipt.value("status", "") == "not_sent",
+                      "release API rejects every nonpublic audience before sending");
+            }
+            auto invalidRelease = publicRelease;
+            invalidRelease["channel_id"] = 123;
+            check(selftestPostJson(startedPort, "/api/releases/announce",
+                                  invalidRelease.dump(), apiToken).status == 400,
+                  "release API rejects a numeric JSON destination instead of narrowing it");
+            invalidRelease = publicRelease;
+            invalidRelease["channel_id"] = "18446744073709551616";
+            check(selftestPostJson(startedPort, "/api/releases/announce",
+                                  invalidRelease.dump(), apiToken).status == 400,
+                  "release API rejects destination overflow before sending");
+            invalidRelease = publicRelease;
+            invalidRelease["extra"] = true;
+            check(selftestPostJson(startedPort, "/api/releases/announce",
+                                  invalidRelease.dump(), apiToken).status == 400,
+                  "release API accepts only its six declared payload fields");
+            invalidRelease = publicRelease;
+            invalidRelease["release_url"] = "http://example.invalid/releases";
+            check(selftestPostJson(startedPort, "/api/releases/announce",
+                                  invalidRelease.dump(), apiToken).status == 400,
+                  "release API rejects HTTP release links before sending");
+
             nlohmann::json apiProjectPayload = {
                 {"name", "API Project Fixture"},
                 {"description", "created through the complete project API"},
@@ -3533,6 +3884,74 @@ BEGIN SELECT RAISE(ABORT,'forced ingest failure'); END
             }
             check(publicSettingsRoundTrip,
                   "public settings round-trip as plaintext while credentials stay sealed and redacted");
+            const std::string announcementMarkerKey =
+                "release_announcement_state/example/public/ExamplePlugin";
+            const std::string announcementMarker = "synthetic-saved-version-state";
+            {
+                auto guard = db.guard();
+                db.setSetting(guard.token(), announcementMarkerKey, announcementMarker);
+            }
+            const SelftestHttpResponse releaseChannelWrite = selftestPostJson(
+                startedPort, "/api/settings",
+                R"json({"release_announcement_channel_id":" 18446744073709551615 "})json",
+                apiToken);
+            const SelftestHttpResponse releaseChannelRead = selftestGetJson(
+                startedPort, "/api/settings", apiToken);
+            const auto releaseChannelSettings = nlohmann::json::parse(
+                releaseChannelRead.body, nullptr, false);
+            check(releaseChannelWrite.status == 200 && releaseChannelRead.status == 200 &&
+                      releaseChannelSettings.is_object() &&
+                      releaseChannelSettings.value("release_announcement_channel_id", "") ==
+                          "18446744073709551615" &&
+                      releaseChannelSettings.value(announcementMarkerKey, "") == "[redacted]",
+                  "release channel accepts and reads a trimmed uint64 maximum while saved version markers stay redacted");
+            const std::vector<nlohmann::json> invalidReleaseChannels{
+                nullptr, true, 123, "0", "-1", "+1", "12x", "1\n2",
+                "18446744073709551616", "[redacted]"
+            };
+            for (const auto& value : invalidReleaseChannels) {
+                const SelftestHttpResponse invalidReleaseChannel = selftestPostJson(
+                    startedPort, "/api/settings",
+                    nlohmann::json({{"release_announcement_channel_id", value}}).dump(),
+                    apiToken);
+                std::string savedChannel;
+                {
+                    auto guard = db.guard();
+                    savedChannel = db.getSetting(guard.token(), "release_announcement_channel_id");
+                }
+                check(invalidReleaseChannel.status == 400 &&
+                          savedChannel == "18446744073709551615",
+                      "invalid release destinations cannot overwrite the saved channel");
+            }
+            const SelftestHttpResponse markerWrite = selftestPostJson(
+                startedPort, "/api/settings",
+                nlohmann::json({{"release_announcement_channel_id", "123"},
+                                {announcementMarkerKey, "replacement"}}).dump(), apiToken);
+            std::string savedAnnouncementChannel, savedAnnouncementMarker;
+            {
+                auto guard = db.guard();
+                savedAnnouncementChannel = db.getSetting(guard.token(), "release_announcement_channel_id");
+                savedAnnouncementMarker = db.getSetting(guard.token(), announcementMarkerKey);
+            }
+            check(markerWrite.status == 403 &&
+                      savedAnnouncementChannel == "18446744073709551615" &&
+                      savedAnnouncementMarker == announcementMarker,
+                  "saved version markers reject API writes and preserve the entire mixed settings request");
+            const SelftestHttpResponse ticketChannelWrite = selftestPostJson(
+                startedPort, "/api/settings", R"json({"notify_channel_id":"123"})json", apiToken);
+            check(ticketChannelWrite.status == 403,
+                  "ticket notification routing retains its native configuration policy");
+            const SelftestHttpResponse releaseChannelDisable = selftestPostJson(
+                startedPort, "/api/settings",
+                R"json({"release_announcement_channel_id":" \t "})json", apiToken);
+            const SelftestHttpResponse disabledChannelRead = selftestGetJson(
+                startedPort, "/api/settings", apiToken);
+            const auto disabledChannelSettings = nlohmann::json::parse(
+                disabledChannelRead.body, nullptr, false);
+            check(releaseChannelDisable.status == 200 && disabledChannelRead.status == 200 &&
+                      disabledChannelSettings.is_object() &&
+                      disabledChannelSettings.value("release_announcement_channel_id", "missing").empty(),
+                  "a blank channel disables posting through the authenticated settings route");
             {
                 auto lk = db.guard();
                 db.setSetting(lk.token(), "detection_patterns", "");

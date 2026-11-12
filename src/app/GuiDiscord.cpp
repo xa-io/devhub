@@ -666,6 +666,39 @@ void drawDiscord(App& a) {
         ImGui::PopTextWrapPos();
     }
 
+    if (sectionHeader(a, "Public release announcements", "discord_releases", false)) {
+        if (!a.dcReleaseLoaded) {
+            auto guard = a.db->guard();
+            copyBuf(a.dcReleaseChan, sizeof(a.dcReleaseChan),
+                    a.db->getSetting(guard.token(), "release_announcement_channel_id"));
+            a.dcReleaseLoaded = true;
+        }
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(
+            "Checks public plugin releases every 30 minutes and posts matching "
+            "changelog notes. The first observation establishes a baseline. "
+            "Saved posted or uncertain attempts prevent duplicate sends. "
+            "Leave the channel blank to disable posting.");
+        ImGui::PopTextWrapPos();
+        ImGui::SetNextItemWidth(190);
+        ImGui::InputTextWithHint("##releaseChannel", "channel id", a.dcReleaseChan,
+                                 sizeof(a.dcReleaseChan));
+        ImGui::SameLine();
+        if (ImGui::Button("Save##releaseChannel")) {
+            const std::string channel = trim(a.dcReleaseChan);
+            std::uint64_t parsed = 0;
+            if (!channel.empty() && !parseDiscordAccessSnowflake(channel, parsed)) {
+                toast(a, "enter a valid nonzero channel id", true);
+            } else {
+                {
+                    auto guard = a.db->guard();
+                    a.db->setSetting(guard.token(), "release_announcement_channel_id", channel);
+                }
+                toast(a, channel.empty() ? "release posting disabled" : "release channel saved");
+            }
+        }
+    }
+
     // ---- bot notifications -------------------------------------------------
     if (sectionHeader(a, "Bot notifications", "discord_notify", false)) {
         if (!a.dcNotifyLoaded) {

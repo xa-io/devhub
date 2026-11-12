@@ -25,9 +25,12 @@
 #include <dpp/once.h>
 
 #include <windows.h> // after dpp (WIN32_LEAN_AND_MEAN keeps winsock1 out)
+#include <winhttp.h>
+#include "WinUtil.h"
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
@@ -2551,12 +2554,99 @@ void DiscordBot::handleReaction(const void* evPtr) {
 // ---------------------------------------------------------------------------
 // outbound: notification cards + moderation
 // ---------------------------------------------------------------------------
+std::string discordCardDescription(const NotifyCard& card) {
+    return card.publicRelease ? card.description
+                              : escapeDiscordMarkdown(card.description);
+}
+
+bool preparePublicReleaseCard(const PublicReleaseAnnouncement& announcement,
+                              NotifyCard& card, std::string& error) {
+    error.clear();
+    if (announcement.audience != "public") {
+        error = "audience must be exactly public";
+        return false;
+    }
+    const std::string channelId = trim(announcement.channelId);
+    uint64_t channel = 0;
+    const auto parsed = std::from_chars(
+        channelId.data(), channelId.data() + channelId.size(), channel);
+    if (channelId.empty() || channelId.size() > 20 ||
+        !std::all_of(channelId.begin(), channelId.end(),
+                     [](char ch) { return ch >= '0' && ch <= '9'; }) ||
+        parsed.ec != std::errc() ||
+        parsed.ptr != channelId.data() + channelId.size() || channel == 0) {
+        error = "channel_id must be a nonzero decimal uint64";
+        return false;
+    }
+
+    const std::string product = trim(announcement.product);
+    const std::string version = trim(announcement.version);
+    const auto validLabel = [](const std::string& value, size_t limit) {
+        return !value.empty() && value.size() <= limit &&
+            std::none_of(value.begin(), value.end(), [](unsigned char ch) {
+                return ch < 32 || ch == 127;
+            });
+    };
+    if (!validLabel(product, 128) || !validLabel(version, 64)) {
+        error = "product and version require single-line text within 128 and 64 UTF-8 bytes";
+        return false;
+    }
+    const std::string notes = replaceAll(trim(announcement.notes), "\r\n", "\n");
+    if (notes.empty() || notes.size() > 4096 ||
+        std::any_of(notes.begin(), notes.end(), [](unsigned char ch) {
+            return (ch < 32 && ch != '\n' && ch != '\t') || ch == 127;
+        })) {
+        error = "notes require nonblank text within 4096 UTF-8 bytes";
+        return false;
+    }
+
+    const std::string url = trim(announcement.releaseUrl);
+    if (url.size() > 1024 || toLower(url.substr(0, 8)) != "https://" ||
+        std::any_of(url.begin(), url.end(), [](unsigned char ch) {
+            return ch <= 32 || ch == 127 || ch == '\\';
+        })) {
+        error = "release_url must be an HTTPS link within 1024 UTF-8 bytes";
+        return false;
+    }
+    const std::wstring wideUrl = widen(url);
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUserNameLength = static_cast<DWORD>(-1);
+    parts.dwPasswordLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(wideUrl.c_str(), static_cast<DWORD>(wideUrl.size()),
+                         0, &parts) ||
+        parts.nScheme != INTERNET_SCHEME_HTTPS || parts.dwHostNameLength == 0 ||
+        parts.dwUserNameLength != 0 || parts.dwPasswordLength != 0) {
+        error = "release_url must have a valid HTTPS host without credentials";
+        return false;
+    }
+
+    NotifyCard prepared;
+    prepared.title = product + " " + version;
+    prepared.description = notes;
+    prepared.url = url;
+    prepared.footer = "Public release";
+    prepared.publicRelease = true;
+    const size_t titleBytes = escapeDiscordMarkdown(prepared.title).size();
+    const size_t descriptionBytes = discordCardDescription(prepared).size();
+    const size_t totalBytes = titleBytes + descriptionBytes +
+        prepared.url.size() + prepared.footer.size();
+    if (titleBytes > 256 || descriptionBytes > 4096 || totalBytes > 6000) {
+        error = "rendered release text exceeds Discord embed limits";
+        return false;
+    }
+    card = std::move(prepared);
+    return true;
+}
+
 static dpp::embed cardToEmbed(const NotifyCard& c) {
     dpp::embed e;
     e.set_title(escapeDiscordMarkdown(c.title));
     if (!c.description.empty())
-        e.set_description(escapeDiscordMarkdown(c.description));
-    if (c.url.rfind("https://discord.com/channels/", 0) == 0)
+        e.set_description(discordCardDescription(c));
+    if (c.publicRelease ||
+        c.url.rfind("https://discord.com/channels/", 0) == 0)
         e.set_url(c.url);
     e.set_color(c.color);
     for (const auto& f : c.fields)
@@ -2575,39 +2665,60 @@ static bool parseSnowflake(const std::string& s, uint64_t& out) {
     return end && *end == '\0' && out != 0;
 }
 
-void DiscordBot::postCard(const std::string& channelId, const NotifyCard& card,
-                          std::function<void(const std::string&)> onPosted,
-                          std::function<void(const std::string&, bool)> onFailed) {
+void DiscordBot::postCard(
+    const std::string& channelId, const NotifyCard& card,
+    std::function<void(const std::string&)> onPosted,
+    std::function<void(const std::string&, bool)> onFailed,
+    std::function<void(const std::string&, CardPostFailure)> onClassifiedFailure) {
+    const auto fail = [onFailed, onClassifiedFailure](
+        const std::string& error, bool retryable, CardPostFailure outcome) {
+        if (onFailed) onFailed(error, retryable);
+        if (onClassifiedFailure) onClassifiedFailure(error, outcome);
+    };
     const std::shared_ptr<dpp::cluster> cluster = lockCluster();
     uint64_t chan = 0;
     if (!cluster || !parseSnowflake(channelId, chan)) {
         appLog("[notify] card NOT posted (bot offline or bad channel id)");
-        if (onFailed)
-            onFailed("bot offline or notification channel id is invalid",
-                     cluster == nullptr);
+        fail("bot offline or notification channel id is invalid",
+             cluster == nullptr, CardPostFailure::NotSent);
         return;
     }
+    bool submissionStarted = false;
     try {
         dpp::message m(dpp::snowflake(chan), "");
         m.add_embed(cardToEmbed(card));
-        cluster->message_create(m, [cluster, onPosted, onFailed](
+        if (card.publicRelease) m.set_allowed_mentions(false, false, false, false);
+        submissionStarted = true;
+        cluster->message_create(m, [cluster, onPosted, fail](
                                        const dpp::confirmation_callback_t& cc) {
             if (cc.is_error()) {
                 const std::string error = redactHttpUrls(cc.get_error().message);
                 appLog("[notify] post FAILED: " + error);
-                if (onFailed)
-                    onFailed(error, retryableDiscordRestFailure(cc));
+                const auto status = cc.http_info.status;
+                const bool definiteRejection =
+                    cc.http_info.error == dpp::h_success &&
+                    status >= 400 && status < 500 && status != 408;
+                fail(error, retryableDiscordRestFailure(cc),
+                     definiteRejection ? CardPostFailure::NotSent
+                                       : CardPostFailure::Unknown);
                 return;
             }
-            const auto& posted = std::get<dpp::message>(cc.value);
-            appLog("[notify] card posted (message " +
-                   std::to_string((uint64_t)posted.id) + ")");
-            if (onPosted) onPosted(std::to_string((uint64_t)posted.id));
+            const auto* posted = std::get_if<dpp::message>(&cc.value);
+            if (posted == nullptr || static_cast<uint64_t>(posted->id) == 0) {
+                fail("Discord returned no message-ID receipt", true,
+                     CardPostFailure::Unknown);
+                return;
+            }
+            const std::string messageId =
+                std::to_string(static_cast<uint64_t>(posted->id));
+            appLog("[notify] card posted (message " + messageId + ")");
+            if (onPosted) onPosted(messageId);
         });
     } catch (const std::exception& e) {
         const std::string error = redactHttpUrls(e.what());
-        appLog("[notify] post could not start: " + error);
-        if (onFailed) onFailed(error, true);
+        appLog("[notify] post failed: " + error);
+        fail(error, true, submissionStarted ? CardPostFailure::Unknown
+                                           : CardPostFailure::NotSent);
     }
 }
 

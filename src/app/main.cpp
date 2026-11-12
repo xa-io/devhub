@@ -196,8 +196,8 @@ int main(int argc, char** argv) {
         MaintenanceRunner maintenance(&db);
         maintenance.requestAutomatic();
         BuildRunner builds(&db);
-        VersionChecker versions(&db);
         DiscordBot discord(&db);
+        VersionChecker versions(&db);
         Server server(&db, &builds, port);
         server.discordStatus = [&discord]() {
             DiscordBot::Status s = discord.status();
@@ -229,6 +229,7 @@ int main(int argc, char** argv) {
             }
             if (!trim(token).empty()) discord.start(token);
         }
+        versions.startAnnouncements(&discord);
 
         if (headless) {
             attachParentConsole();
@@ -260,8 +261,8 @@ int main(int argc, char** argv) {
             rc = runGui(&db, &builds, &versions, &discord, &maintenance, port);
         }
         server.stop();
-        discord.stop();
         versions.stop();
+        discord.stop();
         builds.stop();
         maintenance.stop();
     } catch (const std::exception& e) {

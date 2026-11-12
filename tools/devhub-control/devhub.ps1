@@ -6,7 +6,8 @@
 #           preview, UTF-8 output, bounded queries, exact reads, and mutation readback.
 # Important: Never edits devhub.db. DevHub must own all database writes.
 # Metadata: Author=XA/Codex; Created=2026-07-15; PowerShell=5.1+
-# Release notes: 1.10 - Add optimistic title-only updates and verified canonical ticket merges.
+# Release notes: Unreleased - Add one-attempt public release announcements with Discord receipts.
+#                1.10 - Add optimistic title-only updates and verified canonical ticket merges.
 #                1.09 - Add strict project-bound work creation with exact readback.
 #                1.08 - Resolve exact-instance LocalAppData rendezvous records and fail closed on stale discovery.
 #                1.07 - Remove machine-local token defaults and discover the running DevHub token portably.
@@ -26,7 +27,7 @@ param(
         'health', 'stats', 'project-list', 'project-get', 'project-save',
         'work-list', 'work-get', 'work-save', 'work-title', 'work-merge', 'work-status',
         'work-import',
-        'review-context', 'release-context',
+        'review-context', 'release-context', 'release-announce',
         'knowledge-list', 'knowledge-get', 'knowledge-save', 'source-save',
         'knowledge-add-claim', 'knowledge-link', 'knowledge-health',
         'knowledge-context', 'conflict-list', 'conflict-save',
@@ -250,6 +251,21 @@ function Invoke-DevHub([string]$Method, [string]$Path, [string]$Body = '') {
             -not [string]::IsNullOrWhiteSpace([string]$_.ErrorDetails.Message)) {
             $detail = [string]$_.ErrorDetails.Message
         }
+        if ($Action -eq 'release-announce' -and $Method -eq 'POST' -and
+            $Path -eq '/api/releases/announce') {
+            $statusCode = 0
+            if ($_.Exception.PSObject.Properties.Name -contains 'Response' -and
+                $null -ne $_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            }
+            $deliveryStatus = if ($statusCode -ge 400 -and $statusCode -lt 500 -and
+                                  $statusCode -ne 408) { 'not_sent' } else { 'unknown' }
+            return [pscustomobject]@{
+                ok = $false
+                status = $deliveryStatus
+                error = "DevHub release announcement request failed: $detail"
+            }
+        }
         throw "DevHub $Method $Path failed: $detail"
     }
     $contentType = [string]$response.Headers.'Content-Type'
@@ -294,6 +310,28 @@ $body = ''
 $readback = ''
 
 switch ($Action) {
+    'release-announce' {
+        $method = 'POST'; $body = Resolve-Body; $path = '/api/releases/announce'
+        $releasePayload = $body | ConvertFrom-Json
+        $releaseFields = @('audience', 'channel_id', 'product', 'version', 'release_url', 'notes')
+        $releaseNames = @($releasePayload.PSObject.Properties.Name)
+        if ($releaseNames.Count -ne $releaseFields.Count) {
+            throw 'Release announcement not_sent: provide exactly audience, channel_id, product, version, release_url and notes.'
+        }
+        foreach ($field in $releaseFields) {
+            if ($releaseNames -notcontains $field -or $releasePayload.$field -isnot [string]) {
+                throw "Release announcement not_sent: '$field' must be a string."
+            }
+        }
+        $releaseChannel = ([string]$releasePayload.channel_id).Trim()
+        [uint64]$releaseChannelId = 0
+        if ([string]$releasePayload.audience -cne 'public' -or
+            $releaseChannel -cnotmatch '^[0-9]{1,20}$' -or
+            -not [uint64]::TryParse($releaseChannel, [ref]$releaseChannelId) -or
+            $releaseChannelId -eq 0) {
+            throw 'Release announcement not_sent: audience must be public and channel_id must be a nonzero decimal uint64.'
+        }
+    }
     'health' { $path = '/api/health' }
     'stats' { $path = '/api/stats' }
     'project-list' { $path = '/api/projects' }
@@ -499,6 +537,39 @@ if ($method -ne 'GET' -and -not $PSCmdlet.ShouldProcess($BaseUrl + $path, "$meth
 
 $result = Invoke-DevHub $method $path $body
 $mutationResult = $result
+
+if ($Action -eq 'release-announce') {
+    $receiptValid = $null -ne $result -and $result -isnot [string] -and
+        $result.PSObject.Properties.Name -contains 'status' -and
+        $result.PSObject.Properties.Name -contains 'ok' -and
+        $result.status -is [string] -and
+        $result.ok -is [bool] -and
+        $result.status -cin @('posted', 'not_sent', 'unknown')
+    if ($receiptValid -and $result.status -ceq 'posted') {
+        [uint64]$releaseMessageId = 0
+        $receiptValid = $result.ok -and
+            $result.PSObject.Properties.Name -contains 'message_id' -and
+            $result.message_id -is [string] -and
+            $result.message_id -cmatch '^[0-9]{1,20}$' -and
+            [uint64]::TryParse($result.message_id, [ref]$releaseMessageId) -and
+            $releaseMessageId -ne 0
+        foreach ($field in @('channel_id', 'product', 'version', 'release_url')) {
+            $receiptValid = $receiptValid -and
+                $result.PSObject.Properties.Name -contains $field -and
+                $result.$field -is [string] -and
+                [string]$result.$field -ceq ([string]$releasePayload.$field).Trim()
+        }
+    } elseif ($receiptValid) {
+        $receiptValid = -not $result.ok
+    }
+    if (-not $receiptValid) {
+        $result = [pscustomobject]@{
+            ok = $false
+            status = 'unknown'
+            error = 'The announcement response did not contain a valid outcome and matching Discord message-ID receipt.'
+        }
+    }
+}
 
 if ($Action -eq 'work-list' -and $result -is [array]) {
     if ($ProjectId -gt 0) { $result = @($result | Where-Object project_id -eq $ProjectId) }

@@ -374,6 +374,7 @@ struct App {
     char dcServerId[64]{}, dcChanId[64]{}, dcMonName[128]{};
     char dcPatterns[32768]{}; bool dcPatternsLoaded = false;
     char dcNotifyGuild[64]{}, dcNotifyChan[64]{}; bool dcNotifyLoaded = false;
+    char dcReleaseChan[64]{}; bool dcReleaseLoaded = false;
     std::vector<DiscordAccessRule> dcAccessRules;
     bool dcAccessLoaded = false;
     double dcAccessRefreshAt = 0;
